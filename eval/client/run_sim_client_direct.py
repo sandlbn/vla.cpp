@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import argparse
+import gc
 import sys
 import time
 from pathlib import Path
@@ -145,6 +146,19 @@ if __name__ == "__main__":
 
         client.reset()
         obs, info = env.reset()
+
+        # robosuite builds a fresh offscreen render context on every reset and
+        # drops the old one with a bare `del` (utils/binding_utils.py:1137).
+        # That only frees the underlying GL context if the refcount hits zero,
+        # and it cannot: the context holds `sim` and `sim.add_render_context`
+        # holds the context back, so the pair is a cycle and `__del__` waits for
+        # the cyclic collector. Its thresholds count Python allocations, which a
+        # rollout loop full of C-level numpy and MuJoCo buffers barely moves - so
+        # the contexts pile up. Intel's EGL absorbs that; NVIDIA's runs out and
+        # mjr_readPixels aborts the process about four episodes in, taking the
+        # whole sweep with it. One collect per episode bounds it at two live
+        # contexts and costs microseconds against a multi-second episode.
+        gc.collect()
         run_times, step_id = [], 0
         episode_aborted = False
         done = False

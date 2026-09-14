@@ -1,0 +1,67 @@
+vla: arch = bitvla
+vla(bitvla): un-normalisation key = 'libero_object_no_noops' (BOUNDS_Q99)
+vla(bitvla): vit=BitSigLIP-L 1152d×26L×16h@224  ⇒ 256 patches  mm=1152→2560  lm=BitNet 2560d×30L (20q/5kv×128) rope=500000  chunk×dim=8×7  vocab=128264  resident=F32
+vla(bitvla): ggml backend = CPU (16 threads) - GPU LM module activates below if available
+vla(bitvla): weights resident in 0.86 GiB (int2-packed + F32 sidecars); image_id=128010 proprio_id=128011 action_begin_id=128012 stop_id=128001
+vla(bitvla): CUDA LM forward ENABLED - packed int2 weights = 496.88 MiB, max_seq=1024
+vla(bitvla): CUDA ViT forward ENABLED - packed int2 weights = 94.72 MiB, ffn_pad=4352
+vla(bitvla): CUDA fp32head (ProprioProj+ActionHead) ENABLED - weights = 250.39 MiB on GPU
+vla(bitvla): freed weight_buf (0.86 GiB) - full GPU path (no CPU weights kept)
+vla(bitvla): prefix mode = SEGMENT-B (legacy: append markers) (n_image_markers=0 n_proprio_markers=0 n_img_tok=256)
+action_len=56
+0.253575057
+0.173134819
+0.0973693281
+0.0301456023
+-0.0366720185
+-0.0051626605
+0.424752057
+0.279925704
+0.232383475
+-0.00373475254
+0.0280653778
+-0.0491149649
+-0.0119286887
+0.368235022
+0.288953811
+0.277700603
+-0.00117022544
+0.0245839804
+-0.0432106629
+-0.010744269
+0.343049794
+0.300745457
+0.271294832
+-0.0767602399
+0.022913564
+-0.0470186099
+-0.0149529483
+0.33419469
+0.283286303
+0.240423769
+-0.0860065371
+0.0222968869
+-0.0493356809
+-0.0136339692
+0.356822699
+0.28089267
+0.22846669
+-0.0558107346
+0.0227839239
+-0.0477974676
+-0.0186590832
+0.370086014
+0.280442655
+0.202524468
+-0.121899135
+0.0211790968
+-0.0487000234
+-0.015763713
+0.361557007
+0.264363527
+0.18977876
+-0.0837980211
+0.0187715106
+-0.0496144891
+-0.0182166137
+0.376486182

@@ -72,11 +72,12 @@ the CMake cache (`grep GGML_METAL build/CMakeCache.txt`).
 
 BitVLA is the exception and does not run on Metal at all. It calls
 `ggml_backend_cpu_init()` directly (`src/models/bitvla.cpp:568`) because its
-graph stays on CPU and the LM offloads through CUDA, so it reports `vla(bitvla):
-ggml backend = CPU (N threads)` even on a Metal build - that banner is expected,
-not a broken build. The published GGUFs are also int2-packed, which `model_load`
-rejects outside a CUDA build (`VLA_BITVLA_CUDA_KERNELS`), so on macOS it fails
-to load rather than running slowly.
+graph stays on CPU and the LM offloads through hand-written CUDA or SYCL
+kernels, so it reports `vla(bitvla): ggml backend = CPU (N threads)` even on a
+Metal build - that banner is expected, not a broken build. The published GGUFs
+are also int2-packed, which `model_load` rejects unless one of those kernel sets
+was compiled in (`VLA_BITVLA_GPU_KERNELS`), so on macOS it fails to load rather
+than running slowly.
 
 ## Results
 

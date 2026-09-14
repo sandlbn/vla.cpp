@@ -26,6 +26,7 @@
 #include "scratch_ctx.h"
 #include "act_dtype.h"
 #include "cuda/vla_cuda_ops.h"
+#include "sycl/vla_sycl_ops.h"
 #include "env_flag.h"
 
 #include <chrono>
@@ -390,14 +391,18 @@ std::unique_ptr<ModelArchBase> evo1_create(const std::string& mmproj_path,
         }
         m->backend = b.handle;
 
-        // BF16 activations need BF16-resident weights and the CUDA BF16 GEMM path.
+        // BF16 activations need BF16-resident weights and a GPU BF16 GEMM path.
+        // Both are in tree: src/cuda/vla_cuda_bf16.cu and src/sycl/vla_sycl_bf16.cpp.
+        // Only one of the two register calls is ever more than an empty inline.
         if (opts.act_dtype.value_or(GGML_TYPE_F32) == GGML_TYPE_BF16) {
-            if (b.is_cuda && m->matmul_type == GGML_TYPE_BF16) {
+            if ((b.is_cuda || b.is_sycl) && m->matmul_type == GGML_TYPE_BF16) {
                 m->act_type = GGML_TYPE_BF16;
                 cuda_register_bf16_ops();   // installs the in-tree BF16 CUDA kernels
+                sycl_register_bf16_ops();   // ... or the SYCL ones
                 std::printf("vla(evo1): activations = BF16 (VLA_EVO1_BF16_ACT)\n");
             } else {
-                std::fprintf(stderr, "vla(evo1): VLA_EVO1_BF16_ACT ignored - needs CUDA and BF16 weights\n");
+                std::fprintf(stderr,
+                             "vla(evo1): VLA_EVO1_BF16_ACT ignored - needs CUDA or SYCL and BF16 weights\n");
             }
         }
     }

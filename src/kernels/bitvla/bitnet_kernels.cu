@@ -14,6 +14,7 @@
 
 #include "bitnet_kernels.h"
 
+#include "cuda_compat.h"
 #include "env_flag.h"
 
 #include <cstdio>
@@ -28,7 +29,10 @@
     std::abort();
 }
 
-extern "C" void bitlinear_int8xint2(int8_t* input0, int8_t* input1, __nv_bfloat16* output0, float* s, float* ws, int M, int N, int K, cudaStream_t stream){
+extern "C" void bitlinear_int8xint2(int8_t* input0, int8_t* input1, vla_bf16* output0_, float* s, float* ws, int M, int N, int K, vla_stream stream_){
+    // device.h states the interface in neutral terms; the kernels below are CUDA.
+    __nv_bfloat16* output0 = vla_cu_bf(output0_);
+    cudaStream_t   stream  = vla_cu_stream(stream_);
     if (M == 1 && N == 3840 && K == 2560){
         ladder_int8xint2_kernel<1, 3840, 2560, 3, 8, 16><<<dim3(240, 1, 1), dim3(8, 16, 1), 0, stream>>>(input0, input1, output0, s, ws);
     }
@@ -75,10 +79,12 @@ static bool bitlinear_use_wide() {
 
 extern "C" void bitlinear_int8xint2_m(
     int8_t* input0, int8_t* input1,
-    __nv_bfloat16* output0,
+    vla_bf16* output0_,
     float* s, float* ws,
-    int M, int N, int K, cudaStream_t stream)
+    int M, int N, int K, vla_stream stream_)
 {
+    __nv_bfloat16* output0 = vla_cu_bf(output0_);
+    cudaStream_t   stream  = vla_cu_stream(stream_);
     if (bitlinear_use_wide()) {
 #define WIDE(NN, KK, WS) \
     launch_ladder_int8xint2_m_wide<NN, KK, WS, 128, bitvla_n_tiles_for(NN, KK)>( \
@@ -115,10 +121,18 @@ extern "C" void bitlinear_int8xint2_m(
         bitlinear_unsupported_shape("bitlinear_int8xint2_m", M, N, K);
 }
 
-extern "C" void bitvla_act_quant_cuda(
-    const __nv_bfloat16* in, int8_t* out, float* scales,
-    int M, int K, cudaStream_t stream)
+extern "C" void bitvla_act_quant_pad_cuda(
+    const vla_bf16* in, int8_t* out, float* scales,
+    int M, int K_in, int K_out, vla_stream stream)
 {
     constexpr int BLOCK_THREADS = 256;
-    act_quant_kernel<BLOCK_THREADS><<<dim3(M, 1, 1), dim3(BLOCK_THREADS, 1, 1), 0, stream>>>(in, out, scales, K);
+    act_quant_kernel<BLOCK_THREADS><<<dim3(M, 1, 1), dim3(BLOCK_THREADS, 1, 1), 0, vla_cu_stream(stream)>>>(
+        vla_cu_bf(in), out, scales, K_in, K_out);
+}
+
+extern "C" void bitvla_act_quant_cuda(
+    const vla_bf16* in, int8_t* out, float* scales,
+    int M, int K, vla_stream stream)
+{
+    bitvla_act_quant_pad_cuda(in, out, scales, M, K, K, stream);
 }

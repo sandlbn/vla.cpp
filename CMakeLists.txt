@@ -43,6 +43,10 @@ if(GGML_CUDA)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
     set(_vla_llama_patch PATCH_COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/scripts/patch_ggml_cuda_ext_hook.py <SOURCE_DIR>)
+elseif(GGML_SYCL)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    set(_vla_llama_patch PATCH_COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/scripts/patch_ggml_sycl_ext_hook.py <SOURCE_DIR>)
 elseif(GGML_OPENVINO)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
     set(_vla_llama_patch PATCH_COMMAND ${Python3_EXECUTABLE}
@@ -130,6 +134,15 @@ target_include_directories(vla_core
 # The VLA archs call no llama_* API; only vlm_core needs llama.
 target_link_libraries(vla_core PUBLIC ggml)
 
+# BitVLA's LM / ViT / action-head forward passes. Plain C++ against device.h,
+# gemm.h and the op headers, so both the CUDA and the SYCL kernel target compile
+# the same three files and the layer order exists in exactly one place.
+set(VLA_BITVLA_DRIVER_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/bitvla/bitvla_lm_driver.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/bitvla/bitvla_vit_driver.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/bitvla/bitvla_fp32head_driver.cpp
+)
+
 if(GGML_CUDA)
     target_compile_definitions(vla_core PUBLIC GGML_USE_CUDA)
 
@@ -150,11 +163,16 @@ if(GGML_CUDA)
         set(CMAKE_CUDA_ARCHITECTURES ${_vla_cuda_archs} ${_vla_cuda_ptx}
             CACHE STRING "" FORCE)
     endif()
+    # The three forward drivers are .cpp and are listed once, below, for both
+    # backends: they call device.h/gemm.h/the op headers and nothing else, so
+    # there is no reason for nvcc to see them.
     add_library(bitvla_cuda_kernels STATIC
         src/kernels/bitvla/bitnet_kernels.cu
-        src/kernels/bitvla/bitvla_lm_cuda.cu
-        src/kernels/bitvla/bitvla_vit_cuda.cu
-        src/kernels/bitvla/bitvla_fp32head_cuda.cu
+        src/kernels/bitvla/bitvla_ops_cuda.cu
+        src/kernels/bitvla/bitvla_fp32_ops_cuda.cu
+        src/kernels/bitvla/device_cuda.cu
+        src/kernels/bitvla/gemm_cuda.cu
+        ${VLA_BITVLA_DRIVER_SOURCES}
     )
     set_target_properties(bitvla_cuda_kernels PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON
@@ -169,7 +187,9 @@ if(GGML_CUDA)
     )
     target_link_libraries(bitvla_cuda_kernels PUBLIC CUDA::cublas CUDA::cudart)
     target_link_libraries(vla_core PRIVATE bitvla_cuda_kernels)
-    target_compile_definitions(vla_core PUBLIC VLA_BITVLA_CUDA_KERNELS)
+    # The engine only asks whether hand-written GPU kernels exist; which backend
+    # provides them is the business of src/kernels/bitvla/device.h.
+    target_compile_definitions(vla_core PUBLIC VLA_BITVLA_GPU_KERNELS)
     target_include_directories(vla_core PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
 
     # ggml-cuda link: the hook resolves ggml_cuda_ext_forward out of it.
@@ -199,6 +219,89 @@ if(GGML_SYCL AND NOT GGML_CUDA)
             "See docs/backend/sycl.md.")
     endif()
     target_compile_definitions(vla_core PUBLIC GGML_USE_SYCL)
+
+    # BitVLA's ternary stack on Battlemage. Mirrors bitvla_cuda_kernels above and
+    # implements the same extern "C" symbols, so src/models/bitvla.cpp is shared.
+    #
+    # The ternary GEMM's reference path is dnnl::matmul, so oneDNN is required
+    # rather than optional here. ggml-sycl treats it as optional and quietly
+    # loses performance without it; BitVLA would lose a correctness oracle, so
+    # this one fails the configure instead. It ships in the same oneAPI release
+    # as icpx, so if the compiler was found this will be too.
+    find_package(DNNL REQUIRED)
+
+    add_library(bitvla_sycl_kernels STATIC
+        src/kernels/bitvla/sycl/device_sycl.cpp
+        src/kernels/bitvla/sycl/bitvla_ops_sycl.cpp
+        src/kernels/bitvla/sycl/bitvla_fp32_ops_sycl.cpp
+        src/kernels/bitvla/sycl/bitnet_sycl.cpp
+        src/kernels/bitvla/sycl/bitnet_gemv_sycl.cpp
+        src/kernels/bitvla/sycl/gemm_sycl.cpp
+        ${VLA_BITVLA_DRIVER_SOURCES}
+    )
+    set_target_properties(bitvla_sycl_kernels PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(bitvla_sycl_kernels PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_compile_features(bitvla_sycl_kernels PRIVATE cxx_std_17)
+    # -fp-model=precise because icpx, unlike gcc and clang, defaults to
+    # -fp-model=fast. Leaving it off is opting *in* to reassociation, so "we do
+    # not pass -ffast-math" is not the same statement here that it is elsewhere.
+    #
+    # The two -foffload-fp32-prec-* flags are kept as a statement of intent, but
+    # be clear about what they did not do. SYCL float division is permitted ~2.5
+    # ULP of error by default and on B70 it takes it: act_quant's 127.0f/amax
+    # came out exactly 1 ULP high (0x42295556 against 0x42295555) on 58 of 61
+    # rows. Neither of these flags moved it, and neither did the runtime's
+    # SYCL_PROGRAM_COMPILE_OPTIONS=-cl-fp32-correctly-rounded-divide-sqrt. What
+    # fixed it was doing the division in source - see exact_div in
+    # sycl/sycl_compat.h - which has the further advantage of not depending on a
+    # build flag to stay correct.
+    #
+    # Not one quantised int8 had changed, so this could have been waved through
+    # as a rounding detail. It could not: the ternary GEMM's epilogue divides
+    # too, and the contract there is bit-exactness against host arithmetic, so
+    # 1 ULP is the whole claim rather than a detail of it.
+    target_compile_options(bitvla_sycl_kernels PRIVATE
+        -O3 -fsycl -fp-model=precise -foffload-fp32-prec-div -foffload-fp32-prec-sqrt)
+    # PUBLIC, not PRIVATE. The device images live in this static archive, and
+    # whoever links the archive has to run the SYCL device link step to gather
+    # them into the final binary. libvla_core.so was linked without -fsycl, so
+    # its device images were silently absent and the first kernel launched
+    # through it - bitvla_add_bias_bf16, the first one the ViT forward reaches -
+    # segfaulted inside ProgramManager::getDeviceKernelInfo. The unit tests did
+    # not catch it because they link this archive into an executable and pass
+    # -fsycl themselves.
+    target_link_options(bitvla_sycl_kernels PUBLIC -fsycl)
+    target_link_libraries(bitvla_sycl_kernels PUBLIC DNNL::dnnl)
+    target_link_libraries(vla_core PRIVATE bitvla_sycl_kernels)
+    # Same definition the CUDA branch sets: the engine only asks whether
+    # hand-written GPU kernels exist. Set here only now that every symbol
+    # src/models/bitvla.cpp reaches for has a SYCL definition - while the set was
+    # still incomplete, leaving it off gave a clear "no kernels, running on CPU"
+    # message at load time instead of a link error.
+    target_compile_definitions(vla_core PUBLIC VLA_BITVLA_GPU_KERNELS)
+
+    # ggml-sycl link: the hook resolves ggml_sycl_ext_forward out of it. Mirrors
+    # vla_cuda_ops above, and implements the same idea with a quarter of the
+    # code - ggml-sycl already has BF16 add/mul/unary, so only norm, rms_norm,
+    # scale and the BF16-dst matmul are left. See src/sycl/vla_sycl_bf16.cpp.
+    add_library(vla_sycl_ops STATIC src/sycl/vla_sycl_bf16.cpp)
+    target_include_directories(vla_sycl_ops PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${llama_SOURCE_DIR}/ggml/include
+    )
+    set_target_properties(vla_sycl_ops PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_compile_features(vla_sycl_ops PRIVATE cxx_std_17)
+    # Same -fp-model=precise reasoning as bitvla_sycl_kernels above: icpx defaults
+    # to -fp-model=fast, so leaving it off is opting *in* to reassociation.
+    target_compile_options(vla_sycl_ops PRIVATE
+        -O3 -fsycl -fp-model=precise -foffload-fp32-prec-div -foffload-fp32-prec-sqrt)
+    # PUBLIC for the same reason bitvla_sycl_kernels needs it: the device images
+    # live in this archive and whoever links it must run the SYCL device link.
+    target_link_options(vla_sycl_ops PUBLIC -fsycl)
+    target_link_libraries(vla_sycl_ops PUBLIC DNNL::dnnl ggml ggml-sycl)
+    target_link_libraries(vla_core PRIVATE vla_sycl_ops)
 endif()
 
 # Precedence matches the ladder in src/backend.h.
@@ -225,6 +328,14 @@ target_include_directories(vlm_core
 )
 target_link_libraries(vlm_core PUBLIC llama ggml mtmd llama-common)
 
+# protobuf + ZeroMQ are needed by the two RPC servers and by nothing else -- not
+# by vla_core, the CLI, the bench harness or the tests. On a cluster node with no
+# package manager and no root those three dependencies are unobtainable, and an
+# unconditional REQUIRED aborts the configure before any of the code that does
+# build is reached. Default ON, so an ordinary checkout is unaffected.
+option(VLA_BUILD_SERVERS "Build vla-server and vlm-server (needs protobuf, libzmq, cppzmq)" ON)
+
+if(VLA_BUILD_SERVERS)
 find_package(Protobuf REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(ZeroMQ REQUIRED IMPORTED_TARGET libzmq)
@@ -233,7 +344,8 @@ find_path(CPPZMQ_INCLUDE_DIR NAMES zmq.hpp)
 if(NOT CPPZMQ_INCLUDE_DIR)
     message(FATAL_ERROR
         "cppzmq (zmq.hpp) not found. Install 'cppzmq-dev' (Debian/Ubuntu) or set "
-        "CMAKE_PREFIX_PATH to your cppzmq install prefix.")
+        "CMAKE_PREFIX_PATH to your cppzmq install prefix. "
+        "-DVLA_BUILD_SERVERS=OFF builds everything except the two servers.")
 endif()
 
 set(VLA_PROTO_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/serving/vla.proto)
@@ -295,6 +407,7 @@ target_link_libraries(vlm-server PRIVATE
     protobuf::libprotobuf
     PkgConfig::ZeroMQ
 )
+endif()  # VLA_BUILD_SERVERS
 
 add_library(vla SHARED src/vla_c_api.cpp)
 target_include_directories(vla
@@ -324,7 +437,10 @@ add_executable(vla-bench
 target_link_libraries(vla-bench PRIVATE vla_core)
 
 # Warnings and LTO for our own targets only, never the llama.cpp subtree.
-set(VLA_FIRST_PARTY_TARGETS vla_core vlm_core vla vla-server vlm-server vla-cli vla-bench)
+set(VLA_FIRST_PARTY_TARGETS vla_core vlm_core vla vla-cli vla-bench)
+if(VLA_BUILD_SERVERS)
+    list(APPEND VLA_FIRST_PARTY_TARGETS vla-server vlm-server)
+endif()
 # The CUDA targets were the only first-party code compiled without warnings.
 if(GGML_CUDA)
     list(APPEND VLA_FIRST_PARTY_TARGETS bitvla_cuda_kernels vla_cuda_ops)
@@ -337,7 +453,18 @@ endforeach()
 include(CheckIPOSupported)
 check_ipo_supported(RESULT VLA_IPO_OK OUTPUT VLA_IPO_MSG)
 if(VLA_IPO_OK AND CMAKE_BUILD_TYPE STREQUAL "Release")
-    foreach(tgt IN LISTS VLA_FIRST_PARTY_TARGETS)
+    set(VLA_IPO_TARGETS ${VLA_FIRST_PARTY_TARGETS})
+    if(GGML_CUDA)
+        # Not the CUDA libraries. IPO turns the device link into an nvlink -dlto,
+        # and nvlink refuses to LTO translation units that disagree about -ftz -
+        # which these two deliberately do: bitvla_cuda_kernels is built with
+        # --use_fast_math (the BitVLA kernels were written against it and the
+        # precision contract is stated relative to that), vla_cuda_ops is not,
+        # because it feeds ggml ops that must not flush denormals. The flag
+        # difference is the point, so the LTO has to go rather than the flag.
+        list(REMOVE_ITEM VLA_IPO_TARGETS bitvla_cuda_kernels vla_cuda_ops)
+    endif()
+    foreach(tgt IN LISTS VLA_IPO_TARGETS)
         set_property(TARGET ${tgt} PROPERTY INTERPROCEDURAL_OPTIMIZATION ON)
     endforeach()
 else()

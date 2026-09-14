@@ -283,6 +283,12 @@ view count.
 | Evo-1       | 1 | 448 | 52.2 | 55.2 | 57.3 | 17.8 |
 | pi0.5       | 2 | 224 | 53.4 | 56.1 | 59.3 | 11.4 |
 
+> The BitVLA row predates a fix to its CUDA activation scale, which was 1 ULP off
+> because `--use_fast_math` had made the divide approximate. Correcting it costs
+> about 6% on H100 NVL, so expect ~25 ms rather than 23.6 here once this row is
+> re-measured on a 5090. Details in
+> [docs/backend/sycl.md](docs/backend/sycl.md#the-same-defect-was-already-in-the-cuda-source).
+
 ### Task success
 
 Latency says nothing about whether a policy works. LIBERO-Object, 10 tasks and 20
@@ -315,12 +321,12 @@ supported (released and benchmarked), `~` = in progress, `-` = planned.
 | Model | CPU (x86-64 / ARM) | CUDA | [SYCL (Intel)](docs/backend/sycl.md) | [Metal](docs/backend/metal.md) | [OpenVINO](docs/backend/ov.md) | Hexagon |
 |---|:--:|:--:|:--:|:--:|:--:|:--:|
 | [SmolVLA](https://hf.co/vrfai/smolvla-libero-gguf)             | Y | Y | Y | Y | Y | - | 
-| [π0](https://hf.co/vrfai/pi0-libero-finetuned-v044-gguf)       | Y | Y | - | Y | Y | - | 
+| [π0](https://hf.co/vrfai/pi0-libero-finetuned-v044-gguf)       | Y | Y | Y | Y | Y | - | 
 | [π0.5](https://hf.co/vrfai/pi05-libero-gguf)                   | Y | Y | - | Y | Y | - | 
 | [GR00T N1.5](https://hf.co/vrfai/gr00tn1d5-libero-object-gguf) | Y | Y | - | Y | Y | - | 
 | [GR00T N1.6](https://hf.co/vrfai/gr00tn1d6-libero-gguf)        | Y | Y | - | Y | Y | - | 
 | [GR00T N1.7](https://hf.co/vrfai/gr00tn1d7-libero-gguf)        | Y | Y | - | Y | Y | - | 
-| [BitVLA](https://hf.co/vrfai/bitvla-libero-gguf)               | Y | Y | - | ~ | - | - | 
+| [BitVLA](https://hf.co/vrfai/bitvla-libero-gguf)               | Y | Y | Y | ~ | - | - | 
 | [Evo-1](https://hf.co/vrfai/evo1-libero-gguf)                  | Y | Y | Y | Y | Y | - | 
 | [VLA-Adapter](https://hf.co/vrfai/vla-adapter-libero-gguf)     | Y | Y | ~ | Y | Y | - | 
 | [OpenVLA-OFT](https://hf.co/vrfai/openvla-oft-libero-gguf)     | Y | Y | - | Y | Y | - | 

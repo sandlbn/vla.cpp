@@ -52,3 +52,6 @@ eval/sim/libero/libero_uv/
 eval/sim/simpler/SimplerEnv/
 eval/sim/simpler/simpler_uv/
 /models/
+
+# Slurm job output from ci/slurm/*.sbatch, written into the submit directory.
+slurm_*.out

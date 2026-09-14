@@ -87,7 +87,10 @@ if ! [[ "${N_EPISODES}" =~ ^[1-9][0-9]*$ ]]; then
     exit 1
 fi
 
-SERVER_BIN="${REPO_ROOT}/build/vla-server"
+# BUILD_DIR override: a SYCL or CUDA tree is not built in ./build, and which
+# backend served the episodes is the whole point of a cross-backend sweep.
+BUILD_DIR="${BUILD_DIR:-${REPO_ROOT}/build}"
+SERVER_BIN="${BUILD_DIR}/vla-server"
 VENV_PY="${REPO_ROOT}/eval/sim/libero/libero_uv/.venv/bin/python"
 CLIENT="${REPO_ROOT}/eval/client/run_sim_client_direct.py"
 BIND_ADDR="${BIND_ADDR:-tcp://*:5555}"
@@ -138,8 +141,8 @@ cd "${REPO_ROOT}"
 if [[ "${SKIP_BUILD:-0}" == "1" ]]; then
     echo "[build] skipped (SKIP_BUILD=1)"
 else
-    echo "[build] cmake --build build"
-    cmake --build build -j"$(nproc)"
+    echo "[build] cmake --build ${BUILD_DIR}"
+    cmake --build "${BUILD_DIR}" -j"$(nproc)"
 fi
 
 if [[ ! -x "${SERVER_BIN}" ]]; then
@@ -327,6 +330,14 @@ run_model() {
         unset VLA_OPENVLA_OFT_UNNORM_KEY
     fi
 
+    # Applies to every arch, appended last so it wins over the per-arch defaults
+    # above. This is how an activation-dtype sweep is driven: the same models,
+    # the same episodes, EXTRA_SERVER_ARGS="--act-dtype bf16" on one pass.
+    if [[ -n "${EXTRA_SERVER_ARGS:-}" ]]; then
+        # shellcheck disable=SC2206  # intentional word-split of a flag list
+        server_args+=(${EXTRA_SERVER_ARGS})
+    fi
+
     local log="${LOG_DIR}/${arch}.log"
     echo "===================="
     echo "[${arch}] model_dir=${model_dir}"
@@ -336,7 +347,9 @@ run_model() {
     local out_dir="${OUTPUT_ROOT}/${arch}"
     mkdir -p "${out_dir}"
 
-    for task_id in $(seq 0 9); do
+    # TASK_IDS override: a sweep is ten tasks, but reproducing a crash wants one.
+    # shellcheck disable=SC2206  # intentional word-split of an id list
+    for task_id in ${TASK_IDS:-$(seq 0 9)}; do
         echo "[${arch}] task_id=${task_id}  episodes=${N_EPISODES}"
         "${VENV_PY}" "${CLIENT}" \
             --arch "${arch}" \

@@ -26,8 +26,7 @@
 
 #pragma once
 
-#include <cuda_runtime.h>
-#include <cuda_bf16.h>
+#include "kernels/bitvla/device.h"
 
 #include <cstdint>
 
@@ -43,29 +42,29 @@ extern "C" {
  * per-group scales.
  */
 typedef struct {
-    __nv_bfloat16* ln1_w; ///< Pre-attention LayerNorm scale.
-    __nv_bfloat16* ln1_b; ///< Pre-attention LayerNorm bias.
-    __nv_bfloat16* ln2_w; ///< Pre-FFN LayerNorm scale.
-    __nv_bfloat16* ln2_b; ///< Pre-FFN LayerNorm bias.
+    vla_bf16* ln1_w; ///< Pre-attention LayerNorm scale.
+    vla_bf16* ln1_b; ///< Pre-attention LayerNorm bias.
+    vla_bf16* ln2_w; ///< Pre-FFN LayerNorm scale.
+    vla_bf16* ln2_b; ///< Pre-FFN LayerNorm bias.
 
     int8_t* q_packed;     ///< Ternary Q projection weights.
     float*  q_ws;         ///< Per-group scales for @ref q_packed.
-    __nv_bfloat16* q_b;   ///< Q projection bias.
+    vla_bf16* q_b;   ///< Q projection bias.
     int8_t* k_packed;     ///< Ternary K projection weights.
     float*  k_ws;         ///< Per-group scales for @ref k_packed.
-    __nv_bfloat16* k_b;   ///< K projection bias.
+    vla_bf16* k_b;   ///< K projection bias.
     int8_t* v_packed;     ///< Ternary V projection weights.
     float*  v_ws;         ///< Per-group scales for @ref v_packed.
-    __nv_bfloat16* v_b;   ///< V projection bias.
+    vla_bf16* v_b;   ///< V projection bias.
     int8_t* o_packed;     ///< Ternary output projection weights.
     float*  o_ws;         ///< Per-group scales for @ref o_packed.
-    __nv_bfloat16* o_b;   ///< Output projection bias.
+    vla_bf16* o_b;   ///< Output projection bias.
     int8_t* fc1_packed;   ///< FFN up-projection (hidden -> ffn).
     float*  fc1_ws;       ///< Per-group scales for @ref fc1_packed.
-    __nv_bfloat16* fc1_b; ///< FFN up bias.
+    vla_bf16* fc1_b; ///< FFN up bias.
     int8_t* fc2_packed;   ///< FFN down-projection (ffn -> hidden).
     float*  fc2_ws;       ///< Per-group scales for @ref fc2_packed.
-    __nv_bfloat16* fc2_b; ///< FFN down bias.
+    vla_bf16* fc2_b; ///< FFN down bias.
 } bitvla_vit_layer_cuda;
 
 /// Opaque ViT context; allocate with @ref bitvla_vit_cuda_init.
@@ -110,9 +109,9 @@ void bitvla_vit_cuda_set_layer(bitvla_vit_cuda_ctx* ctx, int L,
  * @param pos_emb  Positional embedding table (n_patches x hidden), bf16.
  */
 void bitvla_vit_cuda_set_embed(bitvla_vit_cuda_ctx* ctx,
-                               const __nv_bfloat16* patch_w,
-                               const __nv_bfloat16* patch_b,
-                               const __nv_bfloat16* pos_emb);
+                               const vla_bf16* patch_w,
+                               const vla_bf16* patch_b,
+                               const vla_bf16* pos_emb);
 
 /**
  * @brief Bind the two FC layers of the mmproj projector.
@@ -123,8 +122,8 @@ void bitvla_vit_cuda_set_embed(bitvla_vit_cuda_ctx* ctx,
  * @param b2   Second FC bias (length mm_out), bf16.
  */
 void bitvla_vit_cuda_set_mmproj(bitvla_vit_cuda_ctx* ctx,
-                                const __nv_bfloat16* W1, const __nv_bfloat16* b1,
-                                const __nv_bfloat16* W2, const __nv_bfloat16* b2);
+                                const vla_bf16* W1, const vla_bf16* b1,
+                                const vla_bf16* W2, const vla_bf16* b2);
 
 /**
  * @brief Run the ViT forward pass on a single image.
@@ -139,9 +138,9 @@ void bitvla_vit_cuda_set_mmproj(bitvla_vit_cuda_ctx* ctx,
  * @return 0 on success, non-zero on dispatch failure.
  */
 int bitvla_vit_cuda_forward(bitvla_vit_cuda_ctx* ctx,
-                            const __nv_bfloat16* d_patches,
-                            __nv_bfloat16* d_out,
-                            cudaStream_t stream);
+                            const vla_bf16* d_patches,
+                            vla_bf16* d_out,
+                            vla_stream stream);
 
 #ifdef __cplusplus
 }

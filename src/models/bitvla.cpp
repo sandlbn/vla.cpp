@@ -28,15 +28,16 @@
 #include "gguf_reader.h"
 #include "scratch_ctx.h"
 
-#ifdef VLA_BITVLA_CUDA_KERNELS
+#ifdef VLA_BITVLA_GPU_KERNELS
 #include "kernels/bitvla/bitvla_lm_cuda.h"
 #include "kernels/bitvla/bitvla_vit_cuda.h"
 #include "kernels/bitvla/bitvla_fp32head_cuda.h"
+#include "kernels/bitvla/device.h"
+#include "kernels/bitvla/ladder_pack.h"
 #include "env_flag.h"
 #ifdef __GLIBC__
 #  include <malloc.h>
 #endif
-#include <cuda_runtime.h>
 #endif
 
 #include <algorithm>
@@ -140,7 +141,7 @@ struct BitvlaModelArch : public ModelArchBase {
     ggml_tensor *ah_b1_ln_w = nullptr, *ah_b1_ln_b = nullptr, *ah_b1_w = nullptr, *ah_b1_b = nullptr;
     ggml_tensor *ah_ln2_w = nullptr, *ah_ln2_b = nullptr, *ah_fc2_w = nullptr, *ah_fc2_b = nullptr;
 
-#ifdef VLA_BITVLA_CUDA_KERNELS
+#ifdef VLA_BITVLA_GPU_KERNELS
 
     bitvla_lm_cuda_ctx*  lm_cuda_ctx  = nullptr;
     bitvla_vit_cuda_ctx* vit_cuda_ctx = nullptr;
@@ -152,14 +153,14 @@ struct BitvlaModelArch : public ModelArchBase {
 
     std::vector<void*>   cpu_kept_ptrs;
 
-    __nv_bfloat16* d_inputs_embeds = nullptr;
-    __nv_bfloat16* d_last_hidden   = nullptr;
-    __nv_bfloat16* d_action_hidden = nullptr;
+    vla_bf16* d_inputs_embeds = nullptr;
+    vla_bf16* d_last_hidden   = nullptr;
+    vla_bf16* d_action_hidden = nullptr;
     int32_t*       d_action_ids    = nullptr;
     int            cuda_max_seq    = 0;
 
-    __nv_bfloat16* d_vit_patches    = nullptr;
-    __nv_bfloat16* d_vit_img_embeds = nullptr;
+    vla_bf16* d_vit_patches    = nullptr;
+    vla_bf16* d_vit_img_embeds = nullptr;
 #endif
 
     std::vector<float> predict(const Inputs& in) override;
@@ -428,7 +429,7 @@ bool load_config(const gguf_reader & g, BitvlaModelArch & m, Config & cfg) {
 
 }
 
-#ifdef VLA_BITVLA_CUDA_KERNELS
+#ifdef VLA_BITVLA_GPU_KERNELS
 namespace {
 
 static void recover_ternary_and_scale(const float* W, int64_t n,
@@ -454,35 +455,12 @@ static void recover_ternary_and_scale(const float* W, int64_t n,
     }
 }
 
+// The layout itself lives in kernels/bitvla/ladder_pack.h, next to the unpack
+// the oneDNN path needs: a packer and an unpacker that disagree is a bug with
+// no symptom until the actions are subtly wrong, so they share their addressing.
 static std::vector<uint8_t> pack_ladder_int2(const int8_t* W, int64_t N, int64_t K) {
-    constexpr int N_BLOCK = 16, K_BLOCK = 8, K_PER_LOOP = 16;
-    constexpr int WMMA_K = 32, K_PER_ITER = K_PER_LOOP * K_BLOCK;
-    const int64_t n_slots = N * K/16;
     std::vector<uint8_t> out(N * K/4, 0);
-    for (int64_t s=0; s<n_slots; ++s) {
-        const int64_t slots_per_block = (N_BLOCK * K)/16;
-        const int64_t n_block  = s/slots_per_block;
-        const int64_t in_block = s%slots_per_block;
-        const int64_t k_0      = in_block/128;
-        const int64_t in_k0    = in_block%128;
-        const int64_t major_k  = in_k0/32;
-        const int64_t in_major = in_k0%32;
-        const int64_t y_half   = in_major/16;
-        const int64_t in_yhalf = in_major%16;
-        const int64_t sub_k    = in_yhalf/8;
-        const int64_t y_in_h   = in_yhalf%8;
-        const int64_t n_global = n_block * N_BLOCK+y_half*8+y_in_h;
-        const int64_t k_sub    = k_0*K_PER_ITER+major_k * WMMA_K+sub_k * K_PER_LOOP;
-        for (int byte_i=0; byte_i<4; ++byte_i) {
-            uint8_t b = 0;
-            for (int j=0; j<4; ++j) {
-                const int t = (int) W[n_global * K+(k_sub+byte_i+4*j)];
-                const uint8_t enc = (uint8_t)(t+2) & 0x3;
-                b |= (enc << (2*j));
-            }
-            out[s*4+byte_i] = b;
-        }
-    }
+    vla::bitvla::ladder_pack_int2(W, N, K, out.data());
     return out;
 }
 
@@ -491,27 +469,24 @@ static inline uint16_t f32_to_bf16_u16(float f) {
     return (uint16_t)(u >> 16);
 }
 
-static __nv_bfloat16* upload_bf16_from_f32(const float* h, size_t n, std::vector<void*>& out_ptrs) {
+static vla_bf16* upload_bf16_from_f32(const float* h, size_t n, std::vector<void*>& out_ptrs) {
     std::vector<uint16_t> tmp(n);
     for (size_t i=0; i<n; ++i)
         tmp[i] = f32_to_bf16_u16(h[i]);
-    __nv_bfloat16* d = nullptr;
-    cudaMalloc(&d, n * sizeof(__nv_bfloat16));
-    cudaMemcpy(d, tmp.data(), n * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
+    vla_bf16* d = (vla_bf16*) vla_dev_malloc(n * sizeof(vla_bf16));
+    vla_dev_memcpy_h2d(d, tmp.data(), n * sizeof(vla_bf16));
     out_ptrs.push_back(d);
     return d;
 }
 static int8_t* upload_int8(const uint8_t* h, size_t n, std::vector<void*>& out_ptrs) {
-    int8_t* d = nullptr;
-    cudaMalloc(&d, n);
-    cudaMemcpy(d, h, n, cudaMemcpyHostToDevice);
+    int8_t* d = (int8_t*) vla_dev_malloc(n);
+    vla_dev_memcpy_h2d(d, h, n);
     out_ptrs.push_back(d);
     return (int8_t*) d;
 }
 static float* upload_f32_scales(const float* sc, int n, std::vector<void*>& out_ptrs) {
-    float* d = nullptr;
-    cudaMalloc(&d, n * sizeof(float));
-    cudaMemcpy(d, sc, n * sizeof(float), cudaMemcpyHostToDevice);
+    float* d = (float*) vla_dev_malloc(n * sizeof(float));
+    vla_dev_memcpy_h2d(d, sc, n * sizeof(float));
     out_ptrs.push_back(d);
     return d;
 }
@@ -550,7 +525,7 @@ static int8_t* pack_and_upload_fused(const std::vector<const float*>& wptrs,
 #endif
 
 BitvlaModelArch::~BitvlaModelArch() {
-#ifdef VLA_BITVLA_CUDA_KERNELS
+#ifdef VLA_BITVLA_GPU_KERNELS
     if (lm_cuda_ctx)
         bitvla_lm_cuda_free(lm_cuda_ctx);
     if (vit_cuda_ctx)
@@ -559,19 +534,19 @@ BitvlaModelArch::~BitvlaModelArch() {
         bitvla_fp32head_cuda_free(fp32head_cuda_ctx);
     for (void* p : cuda_devptrs)
         if (p)
-            cudaFree(p);
+            vla_dev_free(p);
     if (d_inputs_embeds)
-        cudaFree(d_inputs_embeds);
+        vla_dev_free(d_inputs_embeds);
     if (d_last_hidden)
-        cudaFree(d_last_hidden);
+        vla_dev_free(d_last_hidden);
     if (d_action_hidden)
-        cudaFree(d_action_hidden);
+        vla_dev_free(d_action_hidden);
     if (d_action_ids)
-        cudaFree(d_action_ids);
+        vla_dev_free(d_action_ids);
     if (d_vit_patches)
-        cudaFree(d_vit_patches);
+        vla_dev_free(d_vit_patches);
     if (d_vit_img_embeds)
-        cudaFree(d_vit_img_embeds);
+        vla_dev_free(d_vit_img_embeds);
     for (void* p : cpu_kept_ptrs)
         if (p)
             std::free(p);
@@ -631,7 +606,7 @@ std::unique_ptr<ModelArchBase> bitvla_create(const std::string& mmproj_path,
         return nullptr;
     }
     ggml_backend_cpu_set_n_threads(m->backend, m->n_threads);
-    std::printf("vla(bitvla): ggml backend = CPU (%d threads) - CUDA LM module activates below if available\n", m->n_threads);
+    std::printf("vla(bitvla): ggml backend = CPU (%d threads) - GPU LM module activates below if available\n", m->n_threads);
 
     ggml_init_params wp = {  (size_t) 32*1024*1024,  nullptr,  true };
     m->ctx_weights = ggml_init(wp);
@@ -721,20 +696,19 @@ std::unique_ptr<ModelArchBase> bitvla_create(const std::string& mmproj_path,
                                : (m->matmul_type == GGML_TYPE_F32 ? "F32" : "BF16"),
                 m->image_token_id, m->proprio_pad_id, m->action_begin_id, m->stop_id);
 
-#ifndef VLA_BITVLA_CUDA_KERNELS
+#ifndef VLA_BITVLA_GPU_KERNELS
     if (m->packed_int2) {
-        std::fprintf(stderr, "vla(bitvla): int2-packed GGUF requires a CUDA build "
-                             "(VLA_BITVLA_CUDA_KERNELS); use the bf16 GGUF for CPU.\n");
+        std::fprintf(stderr, "vla(bitvla): int2-packed GGUF requires a GPU kernel build "
+                             "(VLA_BITVLA_GPU_KERNELS: CUDA or SYCL); use the bf16 GGUF for CPU.\n");
         return nullptr;
     }
 #endif
 
-#ifdef VLA_BITVLA_CUDA_KERNELS
+#ifdef VLA_BITVLA_GPU_KERNELS
 
     if ((m->packed_int2 || m->matmul_type == GGML_TYPE_F32) && !vla::env_flag("VLA_BITVLA_NO_CUDA_LM")) {
-        int dev_count = 0;
-        if (cudaGetDeviceCount(&dev_count) == cudaSuccess && dev_count > 0) {
-            cudaSetDevice(0);
+        const int dev_count = vla_dev_count();
+        if (dev_count > 0 && vla_dev_set(0) == 0) {
 
             // The ladder kernels dereference the scale pointer unconditionally, so
             // a missing sidecar is a device-side OOB read, not a soft failure.
@@ -828,22 +802,19 @@ std::unique_ptr<ModelArchBase> bitvla_create(const std::string& mmproj_path,
                     std::fprintf(stderr, "vla(bitvla): int2 scale sidecars incomplete; refusing the CUDA LM\n");
                 }
                 if (pack_ok && scales_ok) {
-                    __nv_bfloat16* onorm = upload_bf16_from_f32((const float*) m->lm_output_norm->data, m->lm_hidden, m->cuda_devptrs);
+                    vla_bf16* onorm = upload_bf16_from_f32((const float*) m->lm_output_norm->data, m->lm_hidden, m->cuda_devptrs);
                     bitvla_lm_cuda_set_output_norm(m->lm_cuda_ctx, onorm);
 
-                    cudaError_t lm_ce = cudaMalloc(&m->d_inputs_embeds, (size_t) max_seq * m->lm_hidden*sizeof(__nv_bfloat16));
-                    if (lm_ce == cudaSuccess)
-                        lm_ce = cudaMalloc(&m->d_last_hidden,   (size_t) max_seq * m->lm_hidden*sizeof(__nv_bfloat16));
-                    if (lm_ce == cudaSuccess)
-                        lm_ce = cudaMalloc(&m->d_action_hidden, (size_t) (m->num_actions_chunk*m->action_dim)*m->lm_hidden*sizeof(__nv_bfloat16));
-                    if (lm_ce == cudaSuccess)
-                        lm_ce = cudaMalloc(&m->d_action_ids,    (size_t) (m->num_actions_chunk*m->action_dim)*sizeof(int32_t));
-                    // only enable the CUDA LM once every work buffer is really allocated.
-                    if (lm_ce != cudaSuccess) {
-                        std::fprintf(stderr, "vla(bitvla): CUDA LM buffer alloc failed (%s); using CPU LM\n",
-                                     cudaGetErrorString(lm_ce));
-                        cudaFree(m->d_inputs_embeds); cudaFree(m->d_last_hidden);
-                        cudaFree(m->d_action_hidden); cudaFree(m->d_action_ids);
+                    m->d_inputs_embeds = (vla_bf16*) vla_dev_malloc((size_t) max_seq * m->lm_hidden*sizeof(vla_bf16));
+                    m->d_last_hidden   = (vla_bf16*) vla_dev_malloc((size_t) max_seq * m->lm_hidden*sizeof(vla_bf16));
+                    m->d_action_hidden = (vla_bf16*) vla_dev_malloc((size_t) (m->num_actions_chunk*m->action_dim)*m->lm_hidden*sizeof(vla_bf16));
+                    m->d_action_ids    = (int32_t*)  vla_dev_malloc((size_t) (m->num_actions_chunk*m->action_dim)*sizeof(int32_t));
+                    // only enable the GPU LM once every work buffer is really allocated.
+                    if (!m->d_inputs_embeds || !m->d_last_hidden || !m->d_action_hidden || !m->d_action_ids) {
+                        std::fprintf(stderr, "vla(bitvla): GPU LM buffer alloc failed (%s); using CPU LM\n",
+                                     vla_dev_error());
+                        vla_dev_free(m->d_inputs_embeds); vla_dev_free(m->d_last_hidden);
+                        vla_dev_free(m->d_action_hidden); vla_dev_free(m->d_action_ids);
                         m->d_inputs_embeds = nullptr; m->d_last_hidden = nullptr;
                         m->d_action_hidden = nullptr; m->d_action_ids = nullptr;
                     } else {
@@ -935,19 +906,19 @@ std::unique_ptr<ModelArchBase> bitvla_create(const std::string& mmproj_path,
                         }
                         if (vit_ok) {
 
-                            __nv_bfloat16* pe_w   = upload_bf16_from_f32((const float*) m->vit_patch_w->data, m->vit_hidden*patch_flat, m->cuda_devptrs);
-                            __nv_bfloat16* pe_b   = upload_bf16_from_f32((const float*) m->vit_patch_b->data, m->vit_hidden, m->cuda_devptrs);
-                            __nv_bfloat16* pos_e  = upload_bf16_from_f32((const float*) m->vit_pos->data,     m->n_patches*m->vit_hidden, m->cuda_devptrs);
+                            vla_bf16* pe_w   = upload_bf16_from_f32((const float*) m->vit_patch_w->data, m->vit_hidden*patch_flat, m->cuda_devptrs);
+                            vla_bf16* pe_b   = upload_bf16_from_f32((const float*) m->vit_patch_b->data, m->vit_hidden, m->cuda_devptrs);
+                            vla_bf16* pos_e  = upload_bf16_from_f32((const float*) m->vit_pos->data,     m->n_patches*m->vit_hidden, m->cuda_devptrs);
                             bitvla_vit_cuda_set_embed(m->vit_cuda_ctx, pe_w, pe_b, pos_e);
 
-                            __nv_bfloat16* mm_W1 = upload_bf16_from_f32((const float*) m->mm_l1_w->data, mm_out * m->vit_hidden, m->cuda_devptrs);
-                            __nv_bfloat16* mm_b1 = upload_bf16_from_f32((const float*) m->mm_l1_b->data, mm_out,                 m->cuda_devptrs);
-                            __nv_bfloat16* mm_W2 = upload_bf16_from_f32((const float*) m->mm_l2_w->data, mm_out * mm_out,        m->cuda_devptrs);
-                            __nv_bfloat16* mm_b2 = upload_bf16_from_f32((const float*) m->mm_l2_b->data, mm_out,                 m->cuda_devptrs);
+                            vla_bf16* mm_W1 = upload_bf16_from_f32((const float*) m->mm_l1_w->data, mm_out * m->vit_hidden, m->cuda_devptrs);
+                            vla_bf16* mm_b1 = upload_bf16_from_f32((const float*) m->mm_l1_b->data, mm_out,                 m->cuda_devptrs);
+                            vla_bf16* mm_W2 = upload_bf16_from_f32((const float*) m->mm_l2_w->data, mm_out * mm_out,        m->cuda_devptrs);
+                            vla_bf16* mm_b2 = upload_bf16_from_f32((const float*) m->mm_l2_b->data, mm_out,                 m->cuda_devptrs);
                             bitvla_vit_cuda_set_mmproj(m->vit_cuda_ctx, mm_W1, mm_b1, mm_W2, mm_b2);
 
-                            cudaMalloc(&m->d_vit_patches,    (size_t) m->n_patches*patch_flat * sizeof(__nv_bfloat16));
-                            cudaMalloc(&m->d_vit_img_embeds, (size_t) m->n_patches*mm_out     * sizeof(__nv_bfloat16));
+                            m->d_vit_patches    = (vla_bf16*) vla_dev_malloc((size_t) m->n_patches*patch_flat * sizeof(vla_bf16));
+                            m->d_vit_img_embeds = (vla_bf16*) vla_dev_malloc((size_t) m->n_patches*mm_out     * sizeof(vla_bf16));
                             m->cuda_vit_ready = true;
                             const size_t vit_packed_bytes = (size_t) m->vit_layers*(
                                 4*(size_t) m->vit_hidden*m->vit_hidden/4 +
@@ -972,13 +943,13 @@ std::unique_ptr<ModelArchBase> bitvla_create(const std::string& mmproj_path,
                 std::fprintf(stderr, "vla(bitvla): bitvla_lm_cuda_init failed; falling back to CPU LM\n");
             }
         } else {
-            std::printf("vla(bitvla): no CUDA device - using CPU LM forward\n");
+            std::printf("vla(bitvla): no GPU device - using CPU LM forward\n");
         }
     }
 
     if (m->packed_int2 && !(m->cuda_lm_ready && m->cuda_vit_ready)) {
-        std::fprintf(stderr, "vla(bitvla): int2-packed GGUF requires the CUDA LM+ViT path, which "
-                             "failed to initialize - use the bf16 GGUF, or fix the CUDA setup.\n");
+        std::fprintf(stderr, "vla(bitvla): int2-packed GGUF requires the GPU LM+ViT path, which "
+                             "failed to initialize - use the bf16 GGUF, or fix the GPU setup.\n");
         return nullptr;
     }
 
@@ -1146,17 +1117,17 @@ std::vector<float> BitvlaModelArch::predict(const Inputs& in) {
                 }
             }
 
-#ifdef VLA_BITVLA_CUDA_KERNELS
+#ifdef VLA_BITVLA_GPU_KERNELS
             if (cuda_vit_ready) {
 
                 std::vector<uint16_t> patches_bf16((size_t) N * patch_flat);
                 for (size_t i=0; i<patches_bf16.size(); ++i)
                     patches_bf16[i] = f32_to_bf16_u16(patches[i]);
-                cudaMemcpy(d_vit_patches, patches_bf16.data(), patches_bf16.size()*sizeof(uint16_t), cudaMemcpyHostToDevice);
+                vla_dev_memcpy_h2d(d_vit_patches, patches_bf16.data(), patches_bf16.size()*sizeof(uint16_t));
                 int rc = bitvla_vit_cuda_forward(vit_cuda_ctx, d_vit_patches, d_vit_img_embeds,  0);
                 if (rc != 0) { std::fprintf(stderr, "vla(bitvla): CUDA ViT forward failed (view %lld)\n", (long long) v); return {}; }
                 std::vector<uint16_t> img_bf16((size_t) N * hidden_l);
-                cudaMemcpy(img_bf16.data(), d_vit_img_embeds, img_bf16.size()*sizeof(uint16_t), cudaMemcpyDeviceToHost);
+                vla_dev_memcpy_d2h(img_bf16.data(), d_vit_img_embeds, img_bf16.size()*sizeof(uint16_t));
                 float* dst = img_embeds_host.data()+(size_t) v * N * hidden_l;
                 for (size_t i=0; i<img_bf16.size(); ++i) {
                     uint32_t u = ((uint32_t) img_bf16[i]) << 16;
@@ -1209,7 +1180,7 @@ std::vector<float> BitvlaModelArch::predict(const Inputs& in) {
     std::vector<float> state_host((size_t) proprio_dim, 0.0f);
     if (in.state)
         std::memcpy(state_host.data(), in.state, (size_t) proprio_dim * sizeof(float));
-#ifdef VLA_BITVLA_CUDA_KERNELS
+#ifdef VLA_BITVLA_GPU_KERNELS
     if (cuda_fp32head_ready) {
         if (bitvla_fp32head_proprio_forward(fp32head_cuda_ctx, state_host.data(), proprio_embed_host.data(), 0) != 0) {
             std::fprintf(stderr, "vla(bitvla): CUDA proprio forward failed\n"); return {};
@@ -1336,13 +1307,13 @@ std::vector<float> BitvlaModelArch::predict(const Inputs& in) {
     std::vector<float> last_hidden_at_actions((size_t) n_action * hidden_l);
     const auto t_p0 = clk::now();
 
-#ifdef VLA_BITVLA_CUDA_KERNELS
+#ifdef VLA_BITVLA_GPU_KERNELS
     if (cuda_lm_ready && seq <= cuda_max_seq) {
 
         std::vector<uint16_t> in_bf16((size_t) seq * hidden_l);
         for (size_t i=0; i<in_bf16.size(); ++i)
             in_bf16[i] = f32_to_bf16_u16(inputs_embeds[i]);
-        cudaMemcpy(d_inputs_embeds, in_bf16.data(), in_bf16.size()*sizeof(uint16_t), cudaMemcpyHostToDevice);
+        vla_dev_memcpy_h2d(d_inputs_embeds, in_bf16.data(), in_bf16.size()*sizeof(uint16_t));
 
         int rc = bitvla_lm_cuda_forward(lm_cuda_ctx, d_inputs_embeds, d_last_hidden, (int) seq,  0);
         if (rc != 0) { std::fprintf(stderr, "vla(bitvla): CUDA LM forward failed\n"); return {}; }
@@ -1350,11 +1321,11 @@ std::vector<float> BitvlaModelArch::predict(const Inputs& in) {
         std::vector<int32_t> aids(n_action);
         for (int64_t i=0; i<n_action; ++i)
             aids[i] = (int32_t) (seq-2-n_action+i);
-        cudaMemcpy(d_action_ids, aids.data(), n_action * sizeof(int32_t), cudaMemcpyHostToDevice);
+        vla_dev_memcpy_h2d(d_action_ids, aids.data(), n_action * sizeof(int32_t));
         bitvla_gather_rows_bf16(d_last_hidden, d_action_hidden, d_action_ids, (int) n_action, (int) hidden_l,  0);
 
         std::vector<uint16_t> out_bf16((size_t) n_action * hidden_l);
-        cudaMemcpy(out_bf16.data(), d_action_hidden, out_bf16.size()*sizeof(uint16_t), cudaMemcpyDeviceToHost);
+        vla_dev_memcpy_d2h(out_bf16.data(), d_action_hidden, out_bf16.size()*sizeof(uint16_t));
         for (size_t i=0; i<out_bf16.size(); ++i) {
             uint32_t u = ((uint32_t) out_bf16[i]) << 16;
             float f; std::memcpy(&f, &u, 4);
@@ -1410,7 +1381,7 @@ std::vector<float> BitvlaModelArch::predict(const Inputs& in) {
     const int64_t in_dim = action_dim * hidden_l;
     std::vector<float> normalized_actions((size_t) chunk * action_dim);
     const auto t_d0 = clk::now();
-#ifdef VLA_BITVLA_CUDA_KERNELS
+#ifdef VLA_BITVLA_GPU_KERNELS
     if (cuda_fp32head_ready) {
         if (bitvla_fp32head_action_forward(fp32head_cuda_ctx,
                                             last_hidden_at_actions.data(),

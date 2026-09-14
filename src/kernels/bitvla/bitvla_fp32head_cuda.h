@@ -33,8 +33,7 @@
 
 #pragma once
 
-#include <cuda_runtime.h>
-#include <cublas_v2.h>
+#include "kernels/bitvla/device.h"
 
 /// Opaque context for the FP32 action head; allocate with
 /// @ref bitvla_fp32head_cuda_init.
@@ -104,7 +103,7 @@ int bitvla_fp32head_proprio_forward(
     bitvla_fp32head_cuda_ctx* ctx,
     const float* host_state,
     float* host_out,
-    cudaStream_t stream);
+    vla_stream stream);
 
 /**
  * @brief Run the action head on the LM's pooled hidden state.
@@ -120,7 +119,7 @@ int bitvla_fp32head_action_forward(
     bitvla_fp32head_cuda_ctx* ctx,
     const float* host_ah_input,
     float* host_norm_actions,
-    cudaStream_t stream);
+    vla_stream stream);
 
 /**
  * @brief Release a context returned by @ref bitvla_fp32head_cuda_init.

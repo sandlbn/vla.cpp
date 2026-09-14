@@ -43,6 +43,8 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
+#include "kernels/bitvla/cuda_compat.h"
+
 #if (((__CUDACC_VER_MAJOR__ == 11) && (__CUDACC_VER_MINOR__ >= 4)) || (__CUDACC_VER_MAJOR__ > 11))
 #define TVM_ENABLE_L2_PREFETCH 1
 #else
@@ -141,7 +143,7 @@ __global__ void __launch_bounds__(128) ladder_int8xint2_kernel(int8_t* __restric
   int out_idx = ((((int)blockIdx.x)*N_block_size)+((int)threadIdx.y));
   int ws_idx = out_idx/(N/ws_num);
   if (threadIdx.x == 0)
-    dtype_transform[out_idx] = __float2bfloat16(((float)red_buf0[0])/s[0]*ws[ws_idx]);
+    dtype_transform[out_idx] = __float2bfloat16(vla_exact_div((float)red_buf0[0], s[0])*ws[ws_idx]);
 }
 
 /**
@@ -242,7 +244,7 @@ __global__ void __launch_bounds__(128) ladder_int8xint2_kernel_m(
     const int col = lin & 15;
     const int m = m_base+ml;
     if (m < M)
-      out[m * N+n_base+col] = __float2bfloat16(((float)C_smem[ml][col])/s[m]*wsv);
+      out[m * N+n_base+col] = __float2bfloat16(vla_exact_div((float)C_smem[ml][col], s[m])*wsv);
   }
 }
 
@@ -402,7 +404,7 @@ __global__ void __launch_bounds__(128) ladder_int8xint2_kernel_m_wide(
       const int m   = m_base+(m_tile_base+t)*16+ml;
       if (m < M)
         out[(size_t)m * N+n_base+col] =
-            __float2bfloat16(((float)C_smem[warp][ml][col])/s[m]*wsv);
+            __float2bfloat16(vla_exact_div((float)C_smem[warp][ml][col], s[m])*wsv);
     }
     __syncwarp();
   }
@@ -455,24 +457,41 @@ static inline void launch_ladder_int8xint2_m_wide(
  * written to @p scales; the int8 row is written to @p out. Used to
  * prepare activations for the ternary GEMM kernels above.
  *
+ * The output row may be wider than the input row. The ViT's fc2 takes K padded
+ * up to a multiple of 128, so its fc1 output has to arrive in a wider stride
+ * with a zero tail; letting this kernel widen it is free, because it is already
+ * the only pass that reads every element of that tensor. The alternative - a
+ * separate restriding copy - is not free at all: SYCL has no native 2D copy on
+ * Level Zero and falls back to a byte-granularity kernel that ran the restride
+ * at 6% of B70's memory bandwidth, 4.4 ms of a 27.2 ms request.
+ *
+ * Widening does not perturb the numbers. The scale is an absmax and the tail is
+ * zeros, so @c amax is unchanged, every real column gets the same scale it had,
+ * and the padding quantises to the 0 it was memset to before. Bit-identical,
+ * which matters because the GEMM below is exact and would carry any drift here
+ * straight to the output.
+ *
  * @tparam BLOCK_THREADS Threads per CTA; must be a multiple of 32.
- * @param in     bf16 activation matrix (M x K), device pointer. M is
+ * @param in     bf16 activation matrix (M x K_in), device pointer. M is
  *               passed implicitly via @c blockIdx.x.
- * @param out    int8 quantised matrix (M x K), device pointer.
+ * @param out    int8 quantised matrix (M x K_out), device pointer.
  * @param scales Per-row scales (length M), device pointer.
- * @param K      Row length.
+ * @param K_in   Input row length, and the extent the scale is taken over.
+ * @param K_out  Output row stride; @c [K_in, K_out) is zero-filled. Equal to
+ *               @p K_in for the unpadded case.
  */
 template <int BLOCK_THREADS>
 __global__ void act_quant_kernel(
     const __nv_bfloat16* __restrict__ in,
     int8_t* __restrict__ out,
     float* __restrict__ scales,
-    int K)
+    int K_in, int K_out)
 {
     const int m   = (int)blockIdx.x;
     const int tid = (int)threadIdx.x;
-    const __nv_bfloat16* row_in  = in  + m * K;
-    int8_t*              row_out = out+m * K;
+    const int K   = K_in;
+    const __nv_bfloat16* row_in  = in  + (size_t)m * K_in;
+    int8_t*              row_out = out + (size_t)m * K_out;
 
     float local_max = 0.0f;
     for (int k=tid; k<K; k += BLOCK_THREADS) {
@@ -505,7 +524,7 @@ __global__ void act_quant_kernel(
     }
     __syncthreads();
     const float amax  = smem[0] < 1e-5f ? 1e-5f : smem[0];
-    const float scale = 127.0f/amax;
+    const float scale = vla_exact_div(127.0f, amax);
     if (tid == 0)
         scales[m] = scale;
 
@@ -518,4 +537,9 @@ __global__ void act_quant_kernel(
             q = -128.0f;
         row_out[k] = (int8_t)q;
     }
+
+    // Zero tail. Iterates zero times whenever K_out == K_in, which is every
+    // call but the ViT's fc1, so the unpadded path pays nothing for this.
+    for (int k=K_in+tid; k<K_out; k += BLOCK_THREADS)
+        row_out[k] = 0;
 }

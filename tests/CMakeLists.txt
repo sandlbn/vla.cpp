@@ -56,6 +56,71 @@ if(GGML_CUDA)
     target_link_libraries(bitvla_gemm_check PRIVATE bitvla_cuda_kernels)
 endif()
 
+# The ladder int2 layout and its inverse. Pure CPU: the oneDNN GEMM path reads
+# published weights through the unpack, so it is worth pinning without a GPU.
+add_executable(test_ladder_pack test_ladder_pack.cpp)
+target_include_directories(test_ladder_pack PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_options(test_ladder_pack PRIVATE -Wall -Wextra)
+add_test(NAME ladder_pack COMMAND test_ladder_pack)
+
+# CPU replay of the BitVLA bf16 ops. One source, whichever backend is linked:
+# the ops are declared in vendor-neutral terms, so the SYCL port and the CUDA
+# original are held to the same thresholds by the same code. Skips itself when
+# no GPU is present, so ctest can run it anywhere.
+if(GGML_SYCL AND NOT GGML_CUDA)
+    add_executable(test_bitvla_ops_gpu test_bitvla_ops_gpu.cpp)
+    target_include_directories(test_bitvla_ops_gpu PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(test_bitvla_ops_gpu PRIVATE bitvla_sycl_kernels)
+    # The kernels are a -fsycl archive; the link needs the flag to pull in the
+    # device images, and the test source itself has no SYCL in it.
+    target_link_options(test_bitvla_ops_gpu PRIVATE -fsycl)
+    target_compile_options(test_bitvla_ops_gpu PRIVATE -Wall -Wextra)
+    add_test(NAME bitvla_ops_gpu COMMAND test_bitvla_ops_gpu)
+elseif(GGML_CUDA)
+    add_executable(test_bitvla_ops_gpu test_bitvla_ops_gpu.cpp)
+    target_include_directories(test_bitvla_ops_gpu PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(test_bitvla_ops_gpu PRIVATE bitvla_cuda_kernels)
+    target_compile_options(test_bitvla_ops_gpu PRIVATE -Wall -Wextra)
+    add_test(NAME bitvla_ops_gpu COMMAND test_bitvla_ops_gpu)
+endif()
+
+# The ternary GEMM against host arithmetic. Same source for both backends, and
+# the same near-exact gate: int32 accumulation is order-independent, so a GPU
+# that tiles K differently still owes the identical answer. This is what makes
+# the oneDNN path trustworthy as an oracle for the hand-written DPAS kernel.
+if(GGML_SYCL AND NOT GGML_CUDA)
+    add_executable(test_bitvla_gemm_gpu test_bitvla_gemm_gpu.cpp)
+    target_include_directories(test_bitvla_gemm_gpu PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(test_bitvla_gemm_gpu PRIVATE bitvla_sycl_kernels)
+    target_link_options(test_bitvla_gemm_gpu PRIVATE -fsycl)
+    target_compile_options(test_bitvla_gemm_gpu PRIVATE -Wall -Wextra)
+    add_test(NAME bitvla_gemm_gpu COMMAND test_bitvla_gemm_gpu)
+elseif(GGML_CUDA)
+    add_executable(test_bitvla_gemm_gpu test_bitvla_gemm_gpu.cpp)
+    target_include_directories(test_bitvla_gemm_gpu PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(test_bitvla_gemm_gpu PRIVATE bitvla_cuda_kernels)
+    # --use_fast_math on the kernels makes float division approximate; see the
+    # file comment for why that buys exactly one bf16 step of slack.
+    target_compile_definitions(test_bitvla_gemm_gpu PRIVATE VLA_GEMM_CHECK_FAST_MATH=1)
+    target_compile_options(test_bitvla_gemm_gpu PRIVATE -Wall -Wextra)
+    add_test(NAME bitvla_gemm_gpu COMMAND test_bitvla_gemm_gpu)
+endif()
+
+# Roofline study for Battlemage: the ternary GEMM against ceilings measured on
+# the same device in the same process. Not registered with ctest - it is a
+# measurement, not a gate, and a loaded node would make it a flaky one.
+if(GGML_SYCL AND NOT GGML_CUDA)
+    add_executable(bench_bitvla_bmg bench_bitvla_bmg.cpp)
+    target_include_directories(bench_bitvla_bmg PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(bench_bitvla_bmg PRIVATE bitvla_sycl_kernels)
+    # joint_matrix is an experimental extension and warns about it on every use;
+    # the preflight already confirmed the combinations this asks for exist.
+    target_compile_options(bench_bitvla_bmg PRIVATE
+        -fsycl -O3 -Wall -Wextra -Wno-unused-variable
+        -Wno-sycl-target -DSYCL_EXT_ONEAPI_MATRIX_VERSION=4)
+    target_link_options(bench_bitvla_bmg PRIVATE -fsycl)
+endif()
+
 # Regression test for the in-tree BF16 CUDA kernels and the ggml hook they ride
 # on. Skips itself (exit 0) when no CUDA device is present.
 if(GGML_CUDA)
@@ -64,4 +129,18 @@ if(GGML_CUDA)
     target_link_libraries(test_bf16_cuda_ops PRIVATE vla_cuda_ops ggml)
     target_compile_options(test_bf16_cuda_ops PRIVATE -Wall -Wextra)
     add_test(NAME bf16_cuda_ops COMMAND test_bf16_cuda_ops)
+endif()
+
+# The same regression test for the SYCL side. Skips itself (exit 0) when no SYCL
+# device is present, so a build on a CPU-only node still passes ctest.
+if(GGML_SYCL AND NOT GGML_CUDA)
+    add_executable(test_bf16_sycl_ops test_bf16_sycl_ops.cpp)
+    target_include_directories(test_bf16_sycl_ops PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(test_bf16_sycl_ops PRIVATE vla_sycl_ops ggml)
+    # -fsycl on the link line gathers the device images out of vla_sycl_ops;
+    # without it the first kernel launch segfaults inside the program manager
+    # rather than failing to link. Same trap bitvla_sycl_kernels documents.
+    target_compile_options(test_bf16_sycl_ops PRIVATE -fsycl -Wall -Wextra)
+    target_link_options(test_bf16_sycl_ops PRIVATE -fsycl)
+    add_test(NAME bf16_sycl_ops COMMAND test_bf16_sycl_ops)
 endif()

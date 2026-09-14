@@ -86,6 +86,9 @@ struct Backend {
     /// activation path needs the CUDA BF16 GEMM and elementwise kernels, so
     /// archs gate on this rather than on the compiled-in accelerator.
     bool           is_cuda = false;
+    /// Same, for a live SYCL backend. The BF16 activation path is served there
+    /// by src/sycl/vla_sycl_bf16.cpp plus ggml-sycl's own BF16 add/mul/unary.
+    bool           is_sycl = false;
 };
 
 /**
@@ -212,6 +215,7 @@ inline Backend backend_init(const char * tag, int n_threads) {
             std::fprintf(stderr, "%s: SYCL device %d out of range (%d visible); falling back to CPU\n",
                          tag, dev, n_dev);
         } else if ((b.handle = ggml_backend_sycl_init(dev)) != nullptr) {
+            b.is_sycl = true;
             char desc[256] = { 0 };
             ggml_backend_sycl_get_device_description(dev, desc, sizeof(desc));
             std::printf("%s: backend = SYCL (device %d: %s)\n", tag, dev, desc);

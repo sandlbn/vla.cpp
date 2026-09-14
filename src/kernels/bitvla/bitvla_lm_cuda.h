@@ -32,8 +32,7 @@
 
 #pragma once
 
-#include <cuda_runtime.h>
-#include <cuda_bf16.h>
+#include "kernels/bitvla/device.h"
 
 #include <cstdint>
 
@@ -51,9 +50,9 @@ extern "C" {
  * @param K  Row length.
  * @param stream CUDA stream.
  */
-void bitvla_rmsnorm_bf16(const __nv_bfloat16* x, const __nv_bfloat16* w,
-                         __nv_bfloat16* out, float eps, int M, int K,
-                         cudaStream_t stream);
+void bitvla_rmsnorm_bf16(const vla_bf16* x, const vla_bf16* w,
+                         vla_bf16* out, float eps, int M, int K,
+                         vla_stream stream);
 
 /**
  * @brief Apply NeoX-style rotary position embeddings in place.
@@ -65,9 +64,9 @@ void bitvla_rmsnorm_bf16(const __nv_bfloat16* x, const __nv_bfloat16* w,
  * @param D       Per-head dimension; must be even.
  * @param stream  CUDA stream.
  */
-void bitvla_rope_neox_bf16(__nv_bfloat16* inout, const float* cos_tab,
+void bitvla_rope_neox_bf16(vla_bf16* inout, const float* cos_tab,
                            const float* sin_tab, int H, int S, int D,
-                           cudaStream_t stream);
+                           vla_stream stream);
 
 /**
  * @brief Numerically-stable scaled softmax along the inner (S) axis.
@@ -77,8 +76,8 @@ void bitvla_rope_neox_bf16(__nv_bfloat16* inout, const float* cos_tab,
  * @param S      Softmax length.
  * @param stream CUDA stream.
  */
-void bitvla_softmax_scaled_bf16(__nv_bfloat16* inout, float scale,
-                                int n_rows, int S, cudaStream_t stream);
+void bitvla_softmax_scaled_bf16(vla_bf16* inout, float scale,
+                                int n_rows, int S, vla_stream stream);
 
 /**
  * @brief Elementwise @c relu(g)^2*u (BitVLA squared-ReLU FFN gate).
@@ -88,8 +87,8 @@ void bitvla_softmax_scaled_bf16(__nv_bfloat16* inout, float scale,
  * @param N   Element count.
  * @param stream CUDA stream.
  */
-void bitvla_squared_relu_mul_bf16(const __nv_bfloat16* g, const __nv_bfloat16* u,
-                                  __nv_bfloat16* out, int N, cudaStream_t stream);
+void bitvla_squared_relu_mul_bf16(const vla_bf16* g, const vla_bf16* u,
+                                  vla_bf16* out, int N, vla_stream stream);
 
 /**
  * @brief Elementwise bf16 add (@p out = @p a + @p b).
@@ -99,8 +98,8 @@ void bitvla_squared_relu_mul_bf16(const __nv_bfloat16* g, const __nv_bfloat16* u
  * @param N   Element count.
  * @param stream CUDA stream.
  */
-void bitvla_add_bf16(const __nv_bfloat16* a, const __nv_bfloat16* b,
-                     __nv_bfloat16* out, int N, cudaStream_t stream);
+void bitvla_add_bf16(const vla_bf16* a, const vla_bf16* b,
+                     vla_bf16* out, int N, vla_stream stream);
 
 /**
  * @brief GQA repeat: tile KV heads up to the number of Q heads.
@@ -112,8 +111,8 @@ void bitvla_add_bf16(const __nv_bfloat16* a, const __nv_bfloat16* b,
  * @param hd   Per-head dimension.
  * @param stream CUDA stream.
  */
-void bitvla_repeat_kv_bf16(const __nv_bfloat16* in, __nv_bfloat16* out,
-                           int n_q, int n_kv, int seq, int hd, cudaStream_t stream);
+void bitvla_repeat_kv_bf16(const vla_bf16* in, vla_bf16* out,
+                           int n_q, int n_kv, int seq, int hd, vla_stream stream);
 
 /**
  * @brief Transpose [S, N*hd] -> [N, S, hd] (split last axis into heads).
@@ -125,8 +124,8 @@ void bitvla_repeat_kv_bf16(const __nv_bfloat16* in, __nv_bfloat16* out,
  * @param hd   Per-head dimension.
  * @param stream CUDA stream.
  */
-void bitvla_transpose_sNhd_to_NshHd_bf16(const __nv_bfloat16* in, __nv_bfloat16* out,
-                                         int S, int N, int hd, cudaStream_t stream);
+void bitvla_transpose_sNhd_to_NshHd_bf16(const vla_bf16* in, vla_bf16* out,
+                                         int S, int N, int hd, vla_stream stream);
 
 /**
  * @brief Inverse of @ref bitvla_transpose_sNhd_to_NshHd_bf16.
@@ -138,8 +137,8 @@ void bitvla_transpose_sNhd_to_NshHd_bf16(const __nv_bfloat16* in, __nv_bfloat16*
  * @param hd   Per-head dimension.
  * @param stream CUDA stream.
  */
-void bitvla_transpose_NshHd_to_sNhd_bf16(const __nv_bfloat16* in, __nv_bfloat16* out,
-                                         int N, int S, int hd, cudaStream_t stream);
+void bitvla_transpose_NshHd_to_sNhd_bf16(const vla_bf16* in, vla_bf16* out,
+                                         int N, int S, int hd, vla_stream stream);
 
 /**
  * @brief Gather rows by index (bf16, K-wide rows).
@@ -150,9 +149,9 @@ void bitvla_transpose_NshHd_to_sNhd_bf16(const __nv_bfloat16* in, __nv_bfloat16*
  * @param K        Row length.
  * @param stream   CUDA stream.
  */
-void bitvla_gather_rows_bf16(const __nv_bfloat16* in, __nv_bfloat16* out,
+void bitvla_gather_rows_bf16(const vla_bf16* in, vla_bf16* out,
                              const int32_t* row_ids, int n_rows, int K,
-                             cudaStream_t stream);
+                             vla_stream stream);
 
 /**
  * @brief Affine LayerNorm in bf16 (mean/variance+scale+bias).
@@ -165,9 +164,9 @@ void bitvla_gather_rows_bf16(const __nv_bfloat16* in, __nv_bfloat16* out,
  * @param K  Row length.
  * @param stream CUDA stream.
  */
-void bitvla_layernorm_bf16(const __nv_bfloat16* x, const __nv_bfloat16* w,
-                           const __nv_bfloat16* b, __nv_bfloat16* out,
-                           float eps, int M, int K, cudaStream_t stream);
+void bitvla_layernorm_bf16(const vla_bf16* x, const vla_bf16* w,
+                           const vla_bf16* b, vla_bf16* out,
+                           float eps, int M, int K, vla_stream stream);
 
 /**
  * @brief Elementwise tanh-approximation GELU (BitVLA ViT activation).
@@ -176,8 +175,39 @@ void bitvla_layernorm_bf16(const __nv_bfloat16* x, const __nv_bfloat16* w,
  * @param N   Element count.
  * @param stream CUDA stream.
  */
-void bitvla_gelu_tanh_bf16(const __nv_bfloat16* x, __nv_bfloat16* out,
-                           int N, cudaStream_t stream);
+void bitvla_gelu_tanh_bf16(const vla_bf16* x, vla_bf16* out,
+                           int N, vla_stream stream);
+
+/**
+ * @brief Elementwise exact GELU, @c 0.5*x*(1+erf(x/sqrt(2))).
+ *
+ * The multimodal projector uses this rather than the tanh approximation above,
+ * matching @c ggml_gelu_erf on the CPU path; the two differ by enough at the
+ * tails to be visible in the projected image tokens, so they are separate ops
+ * rather than one op with a flag.
+ *
+ * @param x   Length-@p N input, bf16 device pointer.
+ * @param out Length-@p N output, bf16 device pointer; may equal @p x.
+ * @param N   Element count.
+ * @param stream Stream to launch on.
+ */
+void bitvla_gelu_erf_bf16(const vla_bf16* x, vla_bf16* out,
+                          int N, vla_stream stream);
+
+/**
+ * @brief Fused squared-ReLU gate for the BitNet FFN.
+ *
+ * Reads the (seq x 2*ffn) output of the fused gate/up projection, applies
+ * @c relu(g)^2 * u across the halves of each row, and writes (seq x ffn).
+ * Fused because the alternative is materialising the two halves separately -
+ * the gate_up GEMM emits them interleaved by row, so splitting first would cost
+ * a full pass over the widest tensor in the model.
+ *
+ * @param gu  Gate/up matrix (seq x 2*ffn), gate first.
+ * @param out Output matrix (seq x ffn).
+ */
+void gate_up_fused_sqrelu_mul_bf16(const vla_bf16* gu, vla_bf16* out,
+                                   int seq, int ffn, vla_stream stream);
 
 /**
  * @brief Broadcast-add a per-channel bias to a (M x K) matrix in bf16.
@@ -188,8 +218,8 @@ void bitvla_gelu_tanh_bf16(const __nv_bfloat16* x, __nv_bfloat16* out,
  * @param K    Row length.
  * @param stream CUDA stream.
  */
-void bitvla_add_bias_bf16(const __nv_bfloat16* x, const __nv_bfloat16* bias,
-                          __nv_bfloat16* out, int M, int K, cudaStream_t stream);
+void bitvla_add_bias_bf16(const vla_bf16* x, const vla_bf16* bias,
+                          vla_bf16* out, int M, int K, vla_stream stream);
 
 /**
  * @brief Zero out columns [@p start_col, @p total_cols) of an
@@ -198,8 +228,8 @@ void bitvla_add_bias_bf16(const __nv_bfloat16* x, const __nv_bfloat16* bias,
  *
  * Used to mask out padding lanes added by the ternary GEMM's column tiling.
  */
-void bitvla_zero_tail_bf16(__nv_bfloat16* x, int M, int total_cols,
-                           int start_col, cudaStream_t stream);
+void bitvla_zero_tail_bf16(vla_bf16* x, int M, int total_cols,
+                           int start_col, vla_stream stream);
 
 /**
  * @brief Per-layer weight pointers for one BitVLA LM transformer block.
@@ -209,10 +239,10 @@ void bitvla_zero_tail_bf16(__nv_bfloat16* x, int M, int total_cols,
  * FP32 scales. Norm weights are bf16.
  */
 typedef struct {
-    __nv_bfloat16* attn_norm_w;     ///< Pre-attention RMSNorm scale.
-    __nv_bfloat16* attn_sub_norm_w; ///< BitNet attention sub-norm scale.
-    __nv_bfloat16* ffn_norm_w;      ///< Pre-FFN RMSNorm scale.
-    __nv_bfloat16* ffn_sub_norm_w;  ///< BitNet FFN sub-norm scale.
+    vla_bf16* attn_norm_w;     ///< Pre-attention RMSNorm scale.
+    vla_bf16* attn_sub_norm_w; ///< BitNet attention sub-norm scale.
+    vla_bf16* ffn_norm_w;      ///< Pre-FFN RMSNorm scale.
+    vla_bf16* ffn_sub_norm_w;  ///< BitNet FFN sub-norm scale.
 
     int8_t*        q_packed;        ///< Ternary Q projection weights.
     float*         q_ws;            ///< Per-group scales for @ref q_packed.
@@ -269,7 +299,7 @@ void bitvla_lm_cuda_set_layer(bitvla_lm_cuda_ctx* ctx, int L,
  * @param ctx LM context.
  * @param w   Device pointer to a length-@c hidden bf16 vector.
  */
-void bitvla_lm_cuda_set_output_norm(bitvla_lm_cuda_ctx* ctx, const __nv_bfloat16* w);
+void bitvla_lm_cuda_set_output_norm(bitvla_lm_cuda_ctx* ctx, const vla_bf16* w);
 
 /**
  * @brief Run the LM forward pass on a single batch.
@@ -281,9 +311,9 @@ void bitvla_lm_cuda_set_output_norm(bitvla_lm_cuda_ctx* ctx, const __nv_bfloat16
  * @return 0 on success, non-zero on dispatch failure.
  */
 int bitvla_lm_cuda_forward(bitvla_lm_cuda_ctx* ctx,
-                           const __nv_bfloat16* d_in,
-                           __nv_bfloat16* d_out,
-                           int seq, cudaStream_t stream);
+                           const vla_bf16* d_in,
+                           vla_bf16* d_out,
+                           int seq, vla_stream stream);
 
 #ifdef __cplusplus
 }
