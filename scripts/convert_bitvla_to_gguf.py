@@ -24,6 +24,7 @@ import torch
 import gguf
 from gguf_common import (
     add,
+    add_bf16,
     arg_parser,
     finish,
     kv_f32,
@@ -37,8 +38,10 @@ from gguf_common import (
     require,
     resolve_out
 )
+from bitvla_quant import PACKERS, NotBlockable
 
 ARCH = "bitvla"
+WEIGHT_DTYPES = ("int2", "bf16", *PACKERS)
 KV = kv_prefix(ARCH)
 
 VIT = dict(
@@ -92,6 +95,21 @@ WMMA_K          = 32
 K_PER_ITER      = K_PER_LOOP * K_BLOCK_SIZE
 BYTES_PER_KITER = 512
 
+# Which flavour of BitLinear weight this run writes. Set once from --weight-dtype
+# before any tensor is written, and read by _add_bit/_add_bit_fused.
+#
+#   "int2"  the ladder-packed 2-bit layout the CUDA and SYCL ternary kernels read.
+#           1.58 bits per weight, and unusable without those kernels.
+#   "bf16"  the same ternary values multiplied back out by their absmean scale and
+#           stored dense. Eight times the bytes, and in exchange it is an ordinary
+#           ggml graph that any backend can run -- which is the only way BitVLA
+#           reaches OpenVINO. See docs/backend/ov.md.
+#
+# Module-level rather than threaded through eleven call sites: it is fixed for the
+# life of the process and every writer honours it, so a parameter would only be an
+# opportunity to pass the wrong one.
+_WEIGHT_DTYPE = "int2"
+
 def weight_quant_to_ternary(W: torch.Tensor):
 
     Wf = W.float()
@@ -99,6 +117,17 @@ def weight_quant_to_ternary(W: torch.Tensor):
     s = 1.0 / absmean
     Wq = (Wf * s).round().clamp(-1, 1)
     return Wq.to(torch.int8).cpu().numpy(), float(absmean.item())
+
+def _dense_from_ternary(tern: np.ndarray, scale: float) -> torch.Tensor:
+    """Ternary values scaled back to the numbers a dense GEMM should multiply.
+
+    The kernels keep {-1,0,1} and apply the scale in the GEMM epilogue; a dense
+    backend has no epilogue to put it in, so it is folded into the weight here.
+    Rounding the product to bf16 is not a fidelity loss for the comparison this
+    checkpoint exists to support -- ggml's CPU backend and OpenVINO read the same
+    stored bytes, so the rounding is common to both sides and cancels.
+    """
+    return torch.from_numpy(tern).float() * scale
 
 def pack_ladder_int2(W_ternary: np.ndarray) -> np.ndarray:
 
@@ -177,9 +206,40 @@ def _add_packed(writer, base: str, packed: np.ndarray, scales: np.ndarray) -> No
         raw_dtype=gguf.GGMLQuantizationType.F32
     )
 
+# Tensors a block flavour could not take, named at the end of the run. A
+# footprint that quietly lands above what the flavour promises is how this
+# regresses, so the demotions are reported rather than counted.
+_DEMOTED: list[str] = []
+
+def _add_dense(writer, name: str, tern: np.ndarray, scale: float) -> None:
+    """One BitLinear weight in whichever non-int2 flavour this run asked for.
+
+    bf16 folds the scale into every element; q8_0 and q4_0 keep the ternary
+    integers verbatim and store the scale once per 32 weights, which is smaller
+    *and* more faithful -- see scripts/bitvla_quant.py. A tensor whose K does not
+    divide the 32-element block falls back to bf16 (in this model that is
+    vit.*.fc2, K = 4304, and nothing else).
+    """
+    if _WEIGHT_DTYPE != "bf16":
+        try:
+            packed = PACKERS[_WEIGHT_DTYPE](tern, scale, name)
+        except NotBlockable as e:
+            _DEMOTED.append(f"{name}: {str(e).split(': ', 1)[-1]}")
+        else:
+            writer.add_tensor(name, packed, raw_shape=list(packed.shape),
+                              raw_dtype=gguf.GGMLQuantizationType[_WEIGHT_DTYPE.upper()])
+            return
+    add_bf16(writer, name, _dense_from_ternary(tern, scale))
+
 def _add_bit(writer, base: str, W: torch.Tensor, ffn_pad: int | None = None) -> None:
 
     tern, scale = weight_quant_to_ternary(W)
+    if _WEIGHT_DTYPE != "int2":
+        # No ffn_pad: that padding exists so K divides the ladder layout's tile,
+        # and a dense GEMM has no such constraint. Padding here would change the
+        # shape the loader asserts against and buy nothing.
+        _add_dense(writer, base + ".weight", tern, scale)
+        return
     if ffn_pad is not None and tern.shape[1] < ffn_pad:
         padded = np.zeros((tern.shape[0], ffn_pad), dtype=np.int8)
         padded[:, :tern.shape[1]] = tern
@@ -191,8 +251,22 @@ def _add_bit(writer, base: str, W: torch.Tensor, ffn_pad: int | None = None) -> 
         np.array([scale], dtype=np.float32)
     )
 
-def _add_bit_fused(writer, base: str, Ws: list[torch.Tensor]) -> None:
+def _add_bit_fused(writer, base: str, Ws: list[torch.Tensor], split: list[str] | None = None) -> None:
+    """gate and up, fused for the kernels and separate for a dense graph.
 
+    The ternary kernels want one concatenated projection so a single GEMM covers
+    both halves. `bitvla.cpp` loads that as `ffn_gate_up` only when the checkpoint
+    is int2-packed, and looks for `ffn_gate` / `ffn_up` otherwise, so every dense
+    flavour has to write them apart -- hence @p split, the names to write them
+    under.
+    """
+    if _WEIGHT_DTYPE != "int2":
+        assert split is not None and len(split) == len(Ws), \
+            f"{base}: {_WEIGHT_DTYPE} needs one output name per fused input"
+        for name, W in zip(split, Ws):
+            tern, scale = weight_quant_to_ternary(W)
+            _add_dense(writer, name + ".weight", tern, scale)
+        return
     packed, scales = pack_fused_projection(Ws)
     _add_packed(writer, base, packed, scales)
 
@@ -260,7 +334,11 @@ def _add_kv(writer, statistics_json: str, processor_json: str, preproc_json: str
     )
     writer.add_string(KV("quant.method"),     "absmean_ternary+per_token_int8")
     writer.add_string(KV("quant.applied_at"), "convert")
-    writer.add_uint32(KV("quant.int2_packed"), 1)
+    # Absent, not zero, for the bf16 flavour: bitvla.cpp reads this with
+    # `g.has(...) && g.u32(...) != 0`, and leaving the key out is the form every
+    # pre-existing checkpoint without it already takes.
+    if _WEIGHT_DTYPE == "int2":
+        writer.add_uint32(KV("quant.int2_packed"), 1)
 
     kv_u32(
         writer,
@@ -279,11 +357,27 @@ def _add_kv(writer, statistics_json: str, processor_json: str, preproc_json: str
     writer.add_string(KV("prompt_template"),          PROMPT_TEMPLATE)
 
 def main() -> int:
+    global _WEIGHT_DTYPE
+
     ap = arg_parser(ARCH, "BitVLA libero_* finetune snapshot dir")
+    ap.add_argument(
+        "--weight-dtype",
+        choices=WEIGHT_DTYPES,
+        default="int2",
+        help="BitLinear weight layout: 'int2' (default) is the ladder-packed 2-bit "
+             "form the CUDA/SYCL ternary kernels require. The rest are ggml types "
+             "any backend can run -- including OpenVINO -- at 'bf16' 2.0, 'q8_0' "
+             "1.06 and 'q4_0' 0.56 bytes per weight; the two block formats keep the "
+             "ternary integers exactly and are more faithful than bf16, not less"
+    )
     args = ap.parse_args()
+    _WEIGHT_DTYPE = args.weight_dtype
 
     ckpt = args.ckpt.resolve()
-    out  = resolve_out(args, ckpt, ARCH)
+    # Distinct default names: the flavours are not interchangeable and more than
+    # one is commonly wanted from the same snapshot, so defaulting them onto one
+    # path would silently overwrite whichever was converted first.
+    out  = resolve_out(args, ckpt, ARCH if _WEIGHT_DTYPE == "int2" else f"{ARCH}-{_WEIGHT_DTYPE}")
     ffn_pad = ((VIT["vit_inter"] + 127) // 128) * 128
 
     cfg_json = read_json(ckpt / "config.json")
@@ -378,7 +472,8 @@ def main() -> int:
         _add_bit_fused(
             writer,
             f"lm.blk.{L}.ffn_gate_up",
-            [W[P + "mlp.gate_proj.weight"], W[P + "mlp.up_proj.weight"]]
+            [W[P + "mlp.gate_proj.weight"], W[P + "mlp.up_proj.weight"]],
+            split=[f"lm.blk.{L}.ffn_gate", f"lm.blk.{L}.ffn_up"]
         )
         add(writer, f"lm.blk.{L}.ffn_sub_norm.weight", W[P + "mlp.ffn_sub_norm.weight"])
         _add_bit(writer, f"lm.blk.{L}.ffn_down", W[P + "mlp.down_proj.weight"])
@@ -398,7 +493,21 @@ def main() -> int:
     add(writer, "aex.head.fc2.weight", AH["model.fc2.weight"])
     add(writer, "aex.head.fc2.bias",   AH["model.fc2.bias"])
 
-    return finish(writer, out, "  - int2-packed BitLinear weights + F32 absmean scales (CUDA-only)")
+    if _WEIGHT_DTYPE == "int2":
+        note = ("  - int2-packed BitLinear weights + F32 absmean scales (needs the "
+                "CUDA or SYCL ternary kernels)")
+    elif _WEIGHT_DTYPE == "bf16":
+        note = ("  - dense BF16 BitLinear weights (ternary x absmean); runs on any "
+                "ggml backend, including OpenVINO")
+    else:
+        note = (f"  - {_WEIGHT_DTYPE.upper()} BitLinear weights (ternary integers "
+                f"kept exactly, absmean stored once per 32); runs on any ggml "
+                f"backend, including OpenVINO")
+    for d in _DEMOTED:
+        # Never silent: this is the difference between the flavour's advertised
+        # footprint and the one the file actually has.
+        note += f"\n  - bf16 fallback, {d}"
+    return finish(writer, out, note)
 
 if __name__ == "__main__":
     raise SystemExit(main())

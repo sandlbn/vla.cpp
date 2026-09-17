@@ -13,13 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Thirteen fixes to the fetched ggml OpenVINO backend.
+"""Fourteen fixes to the fetched ggml OpenVINO backend.
 
 ggml-openvino is written against llama.cpp's graphs: one decoder-only
 transformer, one position input, an F16 KV cache. vla.cpp drives it with vision
 towers and action experts instead, which is legal ggml but nothing the backend
 has seen. Eight of the hunks below narrow an llama.cpp-shaped assumption back to
-the ggml contract, one fills a gap in the op table, and two are about the path
+the ggml contract, two fill gaps in the op table, and two are about the path
 those graphs take. Together they are what lets SmolVLA and pi0.5 run end to end
 on the CPU, GPU and NPU plugins. Numbers 4 and 5 are the ones worth upstreaming.
 
@@ -181,6 +181,22 @@ See docs/backend/ov.md for the measured results and for what is still blocked.
      and a late grasp on a robot. GGML_OPENVINO_GPU_PRECISION=f32 puts it at
      6.5e-5. Exposed rather than forced: f32 costs about 3x on this plugin, so
      src/backend.h defaults it for pi0 alone and an explicit setting still wins.
+
+ 14. openvino/op_table.cpp + ggml-openvino.cpp - translate BitVLA's activation
+     quantiser, and only that one. Ten of vla.cpp's eleven architectures build
+     graphs out of stock ggml ops; BitVLA builds one op of its own, the BitNet
+     per-row int8 fake-quant, and that single gap is the whole reason it pinned
+     itself to the CPU backend and never reached this one (docs/backend/ov.md).
+     It is six OpenVINO nodes and no new numerics -- see translate_bitvla_act_quant
+     for the two steps in it that look redundant and are not.
+     The awkward half is that it arrives as GGML_OP_MAP_CUSTOM1, which is not an
+     op so much as a slot: the kernel is a host function pointer, invisible to any
+     backend, so a second model using the slot for something else would be
+     mistranslated into a fake-quant rather than rejected. Hence the name test, in
+     the translator and again in ggml_backend_openvino_device_supports_op -- the
+     latter because that function derives its supported set from the op table's
+     keys, so the table entry alone would have this backend claim every custom op
+     in existence and then throw on it instead of leaving it to the CPU.
 
 Idempotent - re-running on a patched tree is a no-op, so a reconfigure that
 re-populates the FetchContent source dir is safe either way.
@@ -572,6 +588,128 @@ std::unordered_map<std::string, CreatorFunction> get_supported_ops() {""",
         // vla.cpp: tanh approximation for GELU, exact erf for GELU_ERF. ov's Gelu
         // defaults to erf, so the tanh variant must set its mode explicitly.
         {"GGML_UNARY_OP_GELU_ERF",  op::translate_1to1_match_1_input<v7::Gelu>     },""",
+        ),
+        (
+            # Its own namespace block on the far side of the include list, rather than
+            # sharing the one the GELU hunk above opens. Hunks are skipped by testing
+            # whether their replacement is already present, so inserting into another
+            # hunk's replacement text makes that hunk look unapplied on the next run
+            # and the whole patch fails on a re-configure.
+            """#include <openvino/op/tanh.hpp>
+""",
+            """#include <openvino/op/tanh.hpp>
+
+#include <openvino/frontend/exception.hpp>
+#include <openvino/op/abs.hpp>
+#include <openvino/op/clamp.hpp>
+#include <openvino/op/constant.hpp>
+#include <openvino/op/maximum.hpp>
+#include <openvino/op/reduce_max.hpp>
+#include <openvino/op/round.hpp>
+
+namespace ov {
+namespace frontend {
+namespace ggml {
+namespace op {
+
+// vla.cpp: BitVLA's BitNet activation quantiser, the one op in that model's graph
+// that is not stock ggml. It arrives as GGML_OP_MAP_CUSTOM1, ggml's generic escape
+// hatch: such an op identifies its kernel by a host function pointer, which means
+// nothing to another backend, and get_op_type() stringifies only the op enum -- so
+// every custom op anyone writes is indistinguishable here. The tensor name is the
+// only discriminator, and vla.cpp sets it in act_quant() (src/models/bitvla.cpp,
+// BITVLA_ACT_QUANT_NAME). Keep the two in step.
+//
+// Substring rather than equality, because both sides may decorate the name with a
+// "<n>#" disambiguator: vla::graph_unique_names() prepends one in src/backend.h,
+// get_tensor_ov_name() appends one here.
+//
+// The op is a fake-quant -- round to int8 against a per-row scale, then undo that
+// scale -- so it is shape- and type-preserving, and the arithmetic mirrors
+// bitvla_act_quant_op line for line:
+//
+//     amax  = max(reduce_max(|x|, axis=-1), 1e-5)
+//     s     = 127 / amax
+//     inv_s = 1 / s
+//     out   = clamp(rint(x * s), -128, 127) * inv_s
+//
+// Two steps there are load-bearing and must not be tidied up. Rounding is
+// HALF_TO_EVEN because the C uses nearbyintf under the default rounding mode, and
+// Round is a threshold: a value landing on the wrong side of a .5 boundary changes
+// an integer, not a low-order bit. And the last line multiplies by a separately
+// rounded 1/s rather than dividing by s, again because that is what the C does --
+// the two differ by one rounding, and a 1-ULP error in exactly this scale was a
+// shipping bug on both the CUDA and the SYCL kernels (see vla_exact_div in
+// src/kernels/bitvla/cuda_compat.h).
+static OutputVector translate_bitvla_act_quant(const NodeContext & context) {
+    num_inputs_check(context, 1, 1);
+    FRONT_END_OP_CONVERSION_CHECK(context.get_name().find("bitvla.act_quant") != std::string::npos,
+                                  "MAP_CUSTOM1 is a generic ggml custom op and only vla.cpp's "
+                                  "bitvla.act_quant is recognised here; got '", context.get_name(), "'");
+
+    auto input = process_view_input_new(context, 0);
+
+    auto row_max = std::make_shared<ov::op::v1::ReduceMax>(std::make_shared<ov::op::v0::Abs>(input),
+                                                          ov::op::v0::Constant::create(ov::element::i64,
+                                                                                       ov::Shape{1}, {-1}),
+                                                          true);
+    auto amax = std::make_shared<ov::op::v1::Maximum>(
+        row_max, ov::op::v0::Constant::create(ov::element::f32, ov::Shape{1}, {1e-5f}));
+
+    auto s = std::make_shared<ov::op::v1::Divide>(
+        ov::op::v0::Constant::create(ov::element::f32, ov::Shape{1}, {127.0f}), amax);
+    auto inv_s = std::make_shared<ov::op::v1::Divide>(
+        ov::op::v0::Constant::create(ov::element::f32, ov::Shape{1}, {1.0f}), s);
+
+    auto rounded = std::make_shared<ov::op::v5::Round>(std::make_shared<ov::op::v1::Multiply>(input, s),
+                                                      ov::op::v5::Round::RoundMode::HALF_TO_EVEN);
+    auto q = std::make_shared<ov::op::v0::Clamp>(rounded, -128.0, 127.0);
+
+    auto res = std::make_shared<ov::op::v1::Multiply>(q, inv_s);
+    return rename_outputs_with_suffix({res}, context.get_name());
+}
+
+}  // namespace op
+}  // namespace ggml
+}  // namespace frontend
+}  // namespace ov
+""",
+        ),
+        (
+            """        {"GGML_OP_ROLL",            op::translate_roll                             },""",
+            """        {"GGML_OP_ROLL",            op::translate_roll                             },
+        // vla.cpp: BitVLA's activation quantiser. Unlike every other entry here this
+        // one is not "translate this op" but "translate this op when the node carries
+        // a particular name" -- MAP_CUSTOM1 is a slot, not an operation. The name is
+        // checked in translate_bitvla_act_quant and, so the scheduler can still route
+        // an unrecognised custom op to the CPU rather than reach a translator that
+        // will throw, again in ggml_backend_openvino_device_supports_op.
+        {"GGML_OP_MAP_CUSTOM1",     op::translate_bitvla_act_quant                 },""",
+        ),
+    ],
+    "ggml/src/ggml-openvino/ggml-openvino.cpp": [
+        (
+            """    default: {
+        auto supported = supported_ops.find(op->op) != supported_ops.end();""",
+            """    case GGML_OP_MAP_CUSTOM1: {
+        // vla.cpp: the op table's supported set is derived from its keys, so adding a
+        // MAP_CUSTOM1 translator makes this backend claim *every* MAP_CUSTOM1 node --
+        // and a custom op names its kernel with a host function pointer, so one
+        // translator cannot possibly be right for all of them. Without this the next
+        // model to use the escape hatch for something else would get a
+        // FRONT_END_OP_CONVERSION_CHECK at translation time instead of the graceful
+        // CPU fallback the scheduler is there to provide. Same name test as the
+        // translator, for the same reason; see translate_bitvla_act_quant.
+        if (std::string(op->name).find("bitvla.act_quant") == std::string::npos) {
+            return {false, "MAP_CUSTOM1 is a custom op this backend does not recognise"};
+        }
+        if (op->src[0] == nullptr || op->type != GGML_TYPE_F32 || op->src[0]->type != GGML_TYPE_F32) {
+            return {false, "bitvla.act_quant is only translated for F32"};
+        }
+        break;
+    }
+    default: {
+        auto supported = supported_ops.find(op->op) != supported_ops.end();""",
         ),
     ],
     "ggml/src/ggml-openvino/openvino/op/flash_attn_ext.cpp": [

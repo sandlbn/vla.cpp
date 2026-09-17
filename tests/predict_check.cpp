@@ -19,7 +19,9 @@
 //
 //   predict_check <ckpt.gguf> [mmproj.gguf] [n_images]
 //   env: VLA_IMG_SIZE (square input, default 224), VLA_BENCH_ITERS (>0 = time it),
-//        VLA_TIMING=phase, VLA_EXTRA_TOKEN / VLA_EXTRA_COUNT
+//        VLA_TIMING=phase, VLA_EXTRA_TOKEN / VLA_EXTRA_COUNT,
+//        VLA_PRECOMP_IMG_EMB=<raw f32 file> / VLA_PRECOMP_VIEWS (skip the vision
+//        tower and feed the LM these embeddings instead)
 
 #include "model.h"
 #include "options.h"
@@ -95,6 +97,45 @@ int main(int argc, char** argv) {
     Inputs in{};
     in.images        = views.data();
     in.n_images      = n_images;
+
+    // VLA_PRECOMP_IMG_EMB feeds the language model a chosen image embedding
+    // instead of running the vision tower, which is what makes a two-stage model
+    // bisectable: dump mm_proj_out from two backends (VLA_BITVLA_DUMP_DIR), then
+    // replay each through one backend's LM. The difference between those two
+    // replays is the LM's amplification of a known input difference, measured
+    // with the vision tower held out of it entirely.
+    //
+    // The file is raw float32, exactly the mm_proj_out dump: [views * patches,
+    // lm_hidden]. Nothing here can check that shape -- only the model knows
+    // patches and lm_hidden -- so a wrong file is a wrong answer, not an error.
+    std::vector<float> precomp;
+    if (const char* pe = std::getenv("VLA_PRECOMP_IMG_EMB")) {
+        FILE* f = std::fopen(pe, "rb");
+        if (!f) { std::fprintf(stderr, "cannot open VLA_PRECOMP_IMG_EMB=%s\n", pe); return 1; }
+        std::fseek(f, 0, SEEK_END);
+        const long bytes = std::ftell(f);
+        std::fseek(f, 0, SEEK_SET);
+        if (bytes <= 0 || (bytes % (long)sizeof(float)) != 0) {
+            std::fprintf(stderr, "VLA_PRECOMP_IMG_EMB=%s is %ld bytes, not a float32 array\n", pe, bytes);
+            std::fclose(f); return 1;
+        }
+        precomp.resize((size_t)bytes / sizeof(float));
+        if (std::fread(precomp.data(), sizeof(float), precomp.size(), f) != precomp.size()) {
+            std::fprintf(stderr, "short read on VLA_PRECOMP_IMG_EMB=%s\n", pe);
+            std::fclose(f); return 1;
+        }
+        std::fclose(f);
+        const char* nv = std::getenv("VLA_PRECOMP_VIEWS");
+        in.precomputed_img_emb = precomp.data();
+        in.n_img_views         = nv ? std::atoi(nv) : 1;
+        // Inputs documents these as mutually exclusive; an arch that checked
+        // images first would silently run the tower anyway.
+        in.images              = nullptr;
+        in.n_images            = 0;
+        std::fprintf(stderr, "precomputed img emb: %zu floats from %s (%d views)\n",
+                     precomp.size(), pe, in.n_img_views);
+    }
+
     in.lang_tokens   = lang.data();
     in.n_lang        = (int)lang.size();
     in.state         = state.data();

@@ -256,6 +256,22 @@ inline Backend backend_init(const char * tag, int n_threads) {
         // A default, so GGML_OPENVINO_GPU_PRECISION=f16 still wins.
         // Exact match: `tag` is the log prefix, and "vla(pi05)" contains "vla(pi0)",
         // so anything looser would drag pi0.5 in too -- it does not need this.
+        //
+        // bitvla was here too, for a sharper-looking reason, and it has been
+        // measured and removed. Its BitNet activation quantiser rounds to the
+        // nearest integer and clamps ~200 times per forward, so nothing
+        // downstream smooths the arithmetic feeding it: a value landing on the
+        // wrong side of a .5 boundary changes an integer, not a low-order bit,
+        // and one ULP in its 127/amax divide was a shipping bug on both the CUDA
+        // and SYCL kernels (vla_exact_div, src/kernels/bitvla/cuda_compat.h).
+        // That makes per-step action equality useless as a gate here -- one f32
+        // ULP at the LM input moves a normalised action by 0.068 -- so the
+        // measurement had to be task success, and it was: on the B70, 10
+        // LIBERO-object tasks x 10 episodes, F16 and F32 both score 100.0%, at
+        // 16.0 vs 37.5 ms/step (job 372740). The quantiser is a threshold, but
+        // it is a *trained* threshold with margin, and F16 stays inside it.
+        // pi0 is different: it has no threshold to have margin at, it just
+        // accumulates for 10 denoise steps.
         if (tag && std::strcmp(tag, "vla(pi0)") == 0) {
             setenv_default("GGML_OPENVINO_GPU_PRECISION", "f32");
         }

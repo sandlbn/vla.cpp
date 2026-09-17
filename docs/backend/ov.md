@@ -5,14 +5,20 @@ account of how far it currently runs. Like SYCL, OpenVINO is **not**
 auto-detected: it needs an explicit `-DGGML_OPENVINO=ON` and the OpenVINO
 runtime on the configure line.
 
-> **Status: every architecture that can reach this backend translates faithfully,
-> on the CPU plugin and on the iGPU.** That is ten of the eleven in the tree -
-> SmolVLA, π0, π0.5, Evo-1, VLA-Adapter, GR00T N1.5, GR00T N1.6, GR00T N1.7,
-> VLA-JEPA and OpenVLA-OFT - all agreeing with a CPU-backend reference to 1.4e-3 or
-> better on the OpenVINO CPU plugin, and nine of the ten are inside the same bar on
-> the Arc B390 iGPU, where the speedup over the native CPU backend runs from 3.0x
-> to 9.6x. The eleventh, BitVLA, pins its ggml graph to the CPU backend by design
-> and never reaches this backend at all.
+> **Status: every architecture in the tree translates faithfully, on the CPU
+> plugin and on the iGPU.** Ten of the eleven - SmolVLA, π0, π0.5, Evo-1,
+> VLA-Adapter, GR00T N1.5, GR00T N1.6, GR00T N1.7, VLA-JEPA and OpenVLA-OFT -
+> agree with a CPU-backend reference to 1.4e-3 or better on the OpenVINO CPU
+> plugin, and nine of the ten are inside the same bar on the Arc B390 iGPU, where
+> the speedup over the native CPU backend runs from 3.0x to 9.6x.
+>
+> The eleventh, **BitVLA**, used to pin its ggml graph to the CPU backend by
+> design and never reach this backend at all. It does now, and it is the one
+> architecture here that **cannot be scored on action equality** - see
+> [BitVLA has no action bar](#bitvla-has-no-action-bar). It is scored on task
+> success instead, and on an **Arc Pro B70** it solves **100.0%** of LIBERO-object
+> (10 tasks x 10 episodes) at **16.0 ms/step**, against the hand-written SYCL
+> ternary kernels' 22.7 ms on the same silicon.
 >
 > Fifteen fixes were needed, thirteen of them inside ggml's OpenVINO backend, which
 > is written against llama.cpp's graphs and had never seen a vision tower or an
@@ -219,6 +225,94 @@ translation fidelity on the CPU plugin and treat the GPU as a separate precision
 target. π0 is the exception in the other direction, *tighter* on the GPU (6.6e-5)
 because it is the one arch that runs the GPU at F32; see
 [Known issues](#known-issues), which also covers the NPU column.
+
+### BitVLA has no action bar
+
+Every other architecture on this page is scored by comparing action vectors
+against a CPU-backend reference on identical inputs. On BitVLA that comparison
+is meaningless, and it is worth saying why, because the obvious reading of its
+numbers - "the port is 20x worse than everything else" - is wrong.
+
+BitVLA's BitNet activation quantiser rounds to the nearest integer and clamps,
+roughly **200 times per forward pass**. A hard threshold is not a smoothing
+operation: a value that lands on the wrong side of a `.5` boundary changes an
+integer, not a low-order bit, and nothing downstream averages that back out.
+
+Perturbing the LM's input embeddings by a single f32 ULP and measuring the
+resulting action chunk (ggml-CPU on both sides, no OpenVINO anywhere in the
+measurement - `ci/slurm/bmg_bitvla_sensitivity.sbatch`):
+
+| eps | 1.2e-07 | 1e-06 | 1e-05 | 1e-04 | 1e-03 | 6.3e-03 |
+|---|---:|---:|---:|---:|---:|---:|
+| normalised action deviation | 0.0682 | 0.0675 | 0.0747 | 0.0837 | 0.1361 | 0.1427 |
+
+The curve is **flat** all the way down to one ULP. BitVLA therefore has a
+decorrelation floor around **0.068** - 23x the 2.9e-3 bar the other ten
+architectures are held to - and *no* implementation that is not bit-identical to
+ggml-CPU can get under it, including a perfectly correct one. Confirming this,
+the OpenVINO LM on byte-identical inputs scores 0.0702, sitting exactly on the
+floor. Above the floor the numbers are draws from a decorrelated distribution
+and do not even rank configurations: the GPU plugin at F32 scored 0.1092 against
+the CPU plugin's 0.1336, which means nothing at all.
+
+So BitVLA is gated on **task success rate** (`ci/slurm/bmg_ov_libero.sbatch`),
+and that gate is not a weaker one - it is the only one that can distinguish a
+working policy from a broken one here. On the Arc Pro B70 it scores 100.0% over
+10 LIBERO-object tasks x 10 episodes at both F16 and F32 (16.0 vs 37.5 ms/step),
+which is why BitVLA is *not* in the `GGML_OPENVINO_GPU_PRECISION=f32` default
+list in `src/backend.h` even though its quantiser looks like exactly the kind of
+thing that would need to be.
+
+If you are porting another architecture with a hard threshold in its forward
+pass, measure this curve before trusting an action-equality gate on it.
+
+### BitVLA weight flavours
+
+BitVLA's weights carry 1.58 bits each, and until recently the OpenVINO path kept
+them dense at F32 - 10.77 GiB for a 1.44 GiB checkpoint. Three flavours are now
+reachable, all produced from the published int2 GGUF by
+`scripts/transcode_bitvla_int2.py --weight-dtype`, and all measured on the Arc
+Pro B70, 10 LIBERO-object tasks x 5 episodes, GPU plugin at F16 (job 372759):
+
+| flavour | resident | bytes/weight | task success | ms/step |
+|---|---:|---:|---:|---:|
+| F32 (the old default) | 10.77 GiB | 4.00 | - | 37.5 |
+| bf16 | 5.39 GiB | 2.00 | 49/50 = 98.0% | 16.6 |
+| q8_0 | 3.34 GiB | 1.06 | 49/50 = 98.0% | 16.2 |
+| q4_0 | **2.24 GiB** | 0.64 | **50/50 = 100.0%** | 17.1 |
+
+The three arms are within one episode of each other, and the single miss in the
+bf16 and q8_0 arms is the *same* task in both - task difficulty, not a precision
+effect. That is the expected result rather than a lucky one: on ternary weights
+times a per-tensor scale the block formats are **more** faithful than bf16, which
+spends its mantissa re-representing a scale a block format stores once per 32
+weights (max relative error: bf16 1.34e-03, q8_0 5.89e-05, q4_0 1.78e-04 -
+pinned by `ci/test_bitvla_quant.py`).
+
+Two things to know before generating these files yourself:
+
+- **ggml's stock Q4_0 quantiser is unusable on ternary weights** and the reason
+  is structural. Q4_0 dequantises as `d*(q-8)` with `q` in `[0,15]`; ggml picks
+  `d = max/-8`, which reaches `+s` at `q=0` but would need `q=16` for `-s`, so
+  one sign clips to `-7s/8` - 12.5% weight error. `scripts/bitvla_quant.py`
+  instead picks `d = s/7`, putting `{-s, 0, +s}` on `q = {1, 8, 15}` exactly.
+  `ci/test_bitvla_quant.py` pins the 0.125 as a known-bad value so that anyone
+  who later "simplifies" this into a call to `quants.quantize` fails a test.
+- **`vit.blk.N.fc2.weight` cannot be block-quantised.** It is `(4304, 1152)` and
+  `4304 % 32 == 16`, so all 26 of them stay bf16. That is the whole gap between
+  q4_0's ideal 0.5625 bytes/weight and the 0.64 measured.
+
+Only the BitLinear weights are quantised. `token_embd`, the projector, the patch
+embedding and the action head are genuinely full-precision weights rather than
+ternary ones, and stay bf16 - which also keeps quantised constants away from
+`GET_ROWS`.
+
+**Latency does not move**: 16.2-17.1 ms/step across a 2.4x range of resident
+size. Decode at this model size is not weight-bandwidth-bound on the B70, so the
+footprint win is a footprint win and nothing more. Worth knowing before anyone
+spends effort on native `element::u2`, which would buy another 1.6x on size
+against the same flat curve. For context the hand-written SYCL ternary kernels
+run the same workload at 22.7 ms/step and CUDA on an H100 at 23.4 ms.
 
 ## What had to change
 

@@ -406,12 +406,18 @@ fi
 
 # bitvla: vision baked in; tokenizer + dataset_statistics.json auto-load from the
 # GGUF repo on the Hub. Set BITVLA_TOKENIZER=<local ckpt dir> to override (offline).
+#
+# BITVLA_CKPT selects the checkpoint flavour. The default is the published
+# ladder-packed int2 file, which only the CUDA and SYCL kernels can read; the
+# OpenVINO port runs a bf16, q8_0 or q4_0 transcode of it
+# (scripts/transcode_bitvla_int2.py) through the ordinary ggml graph, and those
+# are different files in the same directory.
 if should_run bit; then
     run_model bitvla \
         "${MODELS_ROOT}/bitvla-libero-gguf/libero_object" \
         "${N_ACTION_STEPS_BIT}" \
         "" \
-        "${MODELS_ROOT}/bitvla-libero-gguf/libero_object/bitvla-libero-object.gguf"
+        "${BITVLA_CKPT:-${MODELS_ROOT}/bitvla-libero-gguf/libero_object/bitvla-libero-object.gguf}"
 fi
 
 # vla_adapter: Qwen2.5-0.5B + Bridge-Attention; vision baked in (no mmproj),

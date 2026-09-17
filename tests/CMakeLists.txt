@@ -63,6 +63,30 @@ target_include_directories(test_ladder_pack PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_options(test_ladder_pack PRIVATE -Wall -Wextra)
 add_test(NAME ladder_pack COMMAND test_ladder_pack)
 
+# The Q8_0/Q4_0 ternary encoders in scripts/bitvla_quant.py, dequantised by
+# ggml's own C code. ci/test_bitvla_quant.py writes the fixture and checks it
+# against the encoders on every run, so the pair cannot go stale in either
+# direction. Pure CPU: it reads a checked-in file, no checkpoint and no GPU.
+add_executable(test_bitvla_quant test_bitvla_quant.cpp)
+target_include_directories(test_bitvla_quant PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_bitvla_quant PRIVATE ggml)
+target_compile_definitions(test_bitvla_quant PRIVATE
+    VLA_BITVLA_QUANT_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/data/bitvla_q_blocks.bin")
+target_compile_options(test_bitvla_quant PRIVATE -Wall -Wextra)
+add_test(NAME bitvla_quant COMMAND test_bitvla_quant)
+
+# BitVLA's activation quantiser through the OpenVINO translator added by hunk 14
+# of scripts/patch_ggml_openvino.py. Only ggml is linked: the test builds its own
+# one-node graph and compares the backend against ggml's CPU execution of it, so
+# it needs no checkpoint. Skips itself (exit 0) when the runtime finds no device.
+if(GGML_OPENVINO)
+    add_executable(test_bitvla_act_quant_ov test_bitvla_act_quant_ov.cpp)
+    target_include_directories(test_bitvla_act_quant_ov PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(test_bitvla_act_quant_ov PRIVATE ggml)
+    target_compile_options(test_bitvla_act_quant_ov PRIVATE -Wall -Wextra)
+    add_test(NAME bitvla_act_quant_ov COMMAND test_bitvla_act_quant_ov)
+endif()
+
 # CPU replay of the BitVLA bf16 ops. One source, whichever backend is linked:
 # the ops are declared in vendor-neutral terms, so the SYCL port and the CUDA
 # original are held to the same thresholds by the same code. Skips itself when

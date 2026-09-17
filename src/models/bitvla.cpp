@@ -115,7 +115,12 @@ struct BitvlaModelArch : public ModelArchBase {
     scratch_ctx           head_scratch;
     ggml_backend_buffer_t weight_buf  = nullptr;
     ggml_type             matmul_type = GGML_TYPE_F32;
-    bool                  packed_int2 = false;
+    // What the checkpoint stores for a BitLinear weight, which is not the same
+    // question as matmul_type: a block-quantised weight stays in its own type
+    // whatever matmul_type says (gguf_reader::resident_type).
+    ggml_type             bit_type      = GGML_TYPE_F32;
+    bool                  packed_int2   = false;
+    bool                  kernels_drive = false;
 
     int64_t vit_hidden = 1152, vit_layers = 26, vit_heads = 16, vit_head_dim = 72, vit_inter = 4304;
     int64_t image_size = 224, patch_size = 14, n_patches = 256;
@@ -168,8 +173,21 @@ struct BitvlaModelArch : public ModelArchBase {
 
 namespace {
 
+/// @brief The name every act_quant node carries, and the only thing that tells a
+///        backend which custom op a GGML_OP_MAP_CUSTOM1 node actually is.
+///
+/// ggml identifies a custom op by a host function pointer, which survives no
+/// translation to another backend: ggml-openvino stringifies the op enum and sees
+/// only "GGML_OP_MAP_CUSTOM1", the same for every custom op anyone ever writes.
+/// So the name is the discriminator, and the translator added by
+/// scripts/patch_ggml_openvino.py refuses any MAP_CUSTOM1 node without it rather
+/// than assume every custom op is this one. Keep the two in step.
+constexpr const char * BITVLA_ACT_QUANT_NAME = "bitvla.act_quant";
+
 ggml_tensor * act_quant(ggml_context * C, ggml_tensor * x) {
-    return ggml_map_custom1(C, x, bitvla_act_quant_op, GGML_N_TASKS_MAX, nullptr);
+    ggml_tensor * q = ggml_map_custom1(C, x, bitvla_act_quant_op, GGML_N_TASKS_MAX, nullptr);
+    ggml_set_name(q, BITVLA_ACT_QUANT_NAME);
+    return q;
 }
 
 ggml_tensor * bit_linear(ggml_context * C, ggml_tensor * W, ggml_tensor * b, ggml_tensor * x) {
@@ -568,7 +586,6 @@ std::unique_ptr<ModelArchBase> bitvla_create(const std::string& mmproj_path,
 
     auto m = std::make_unique<BitvlaModelArch>();
     m->gguf_path   = ckpt_path;
-    m->matmul_type = opts.weight_dtype.value_or(GGML_TYPE_F32);
 
     gguf_reader g("bitvla");
     if (!g.open(ckpt_path))
@@ -578,6 +595,52 @@ std::unique_ptr<ModelArchBase> bitvla_create(const std::string& mmproj_path,
     }
     if (!load_config(g, *m, m->cfg))
         return nullptr;
+
+    // What this checkpoint actually stores, read before anything decides what to
+    // do about it. A ternary weight can arrive in four forms: ladder-packed int2
+    // (declared I8, flagged by bitvla.quant.int2_packed), dense BF16, or a ggml
+    // block format -- Q8_0 and Q4_0 both hold the ternary integers exactly and
+    // keep the absmean once per 32 weights, so they are smaller than BF16 and
+    // more faithful than it. See scripts/bitvla_quant.py.
+    if (const ggml_tensor * bw = g.meta("lm.blk.0.attn_q.weight"))
+        m->bit_type = bw->type;
+    const bool bit_quantized = ggml_is_quantized(m->bit_type);
+    // The two are meant to be mutually exclusive, and are, because the int2
+    // flavour declares its packed bytes as I8 and ggml_is_quantized(I8) is
+    // false. Asserted rather than assumed: if that ever stopped holding, the
+    // gate below would hand the ternary kernels blocks they cannot read.
+    GGML_ASSERT(!(bit_quantized && m->packed_int2));
+
+    // Resident type for the tensors the file stores dense. Two different jobs
+    // used to share this value: on a kernel build F32 is not a memory choice, it
+    // is the signal that the ternary kernels take the GEMMs and want dense f32
+    // they can re-quantise, so that default stays exactly where it was. Off a
+    // kernel build there is nothing to feed, and defaulting to F32 only bought a
+    // silent 2x upconvert of a BF16 checkpoint -- so follow the file instead.
+    // The asymmetry is deliberate; it is not an inconsistency to tidy away.
+#ifdef VLA_BITVLA_GPU_KERNELS
+    m->matmul_type = opts.weight_dtype.value_or(GGML_TYPE_F32);
+#else
+    // The projector: present in every flavour, and one of the tensors this is
+    // actually the resident type *for*. Only followed when it is a plain float
+    // type -- a quantised source keeps its own type via resident_type() and does
+    // not need, or want, to become the target every dense tensor converts to.
+    const ggml_tensor * dense_probe = g.meta("mm.linear_1.weight");
+    const ggml_type     dense_from  = (dense_probe && !ggml_is_quantized(dense_probe->type))
+                                    ? dense_probe->type : GGML_TYPE_F32;
+    m->matmul_type = opts.weight_dtype.value_or(dense_from);
+#endif
+
+    // One gate, read in two places. It used to be written out twice with a
+    // comment asking the next reader to keep them in step.
+    m->kernels_drive =
+#ifdef VLA_BITVLA_GPU_KERNELS
+        !bit_quantized
+        && (m->packed_int2 || m->matmul_type == GGML_TYPE_F32)
+        && !vla::env_flag("VLA_BITVLA_NO_CUDA_LM");
+#else
+        false;
+#endif
 
     // Keep one reader open for the per-step token-embedding fetches (token_embd
     // stays on disk under int2 packing) and cache the constant stop-token row,
@@ -590,23 +653,47 @@ std::unique_ptr<ModelArchBase> bitvla_create(const std::string& mmproj_path,
         if (!m->emb_reader.fetch_rows_f32("token_embd.weight", sid,
                                           m->stop_embed.data(), m->lm_hidden)) return nullptr;
     }
+    // "bitlinear/dense": the two are independent, and after the low-precision
+    // work they routinely differ (Q4_0 weights next to BF16 everything-else).
+    char resident[64];
+    std::snprintf(resident, sizeof(resident), "%s/%s",
+                  m->packed_int2 ? "int2" : ggml_type_name(m->bit_type),
+                  ggml_type_name(m->matmul_type));
     std::printf("vla(bitvla): vit=BitSigLIP-L %lldd×%lldL×%lldh@%lld  ⇒ %lld patches  mm=%lld→%lld  "
                 "lm=BitNet %lldd×%lldL (%lldq/%lldkv×%lld) rope=%g  chunk×dim=%lld×%lld  vocab=%lld  resident=%s\n",
                 (long long) m->vit_hidden, (long long) m->vit_layers, (long long) m->vit_heads, (long long) m->image_size,
                 (long long) m->n_patches, (long long) m->vit_hidden, (long long) m->lm_hidden,
                 (long long) m->lm_hidden, (long long) m->lm_layers, (long long) m->lm_q, (long long) m->lm_kv, (long long) m->lm_head_dim,
                 (double) m->lm_rope_base, (long long) m->num_actions_chunk, (long long) m->action_dim,
-                (long long) m->vocab_size, m->matmul_type == GGML_TYPE_F32 ? "F32" : "BF16");
+                (long long) m->vocab_size, resident);
 
-    // Not backend_init: the ggml graph stays on CPU and the LM offloads through
-    // the ternary CUDA kernels below.
-    m->backend = ggml_backend_cpu_init();
-    if (!m->backend) {
-        std::fprintf(stderr, "vla(bitvla): ggml_backend_cpu_init failed\n");
-        return nullptr;
+    // Which backend the ggml graph runs on depends on what the checkpoint asks
+    // for, and this is the one arch where that is not "the one the build has".
+    //
+    // An int2-packed checkpoint (or a bf16 one asked for at F32) offloads the LM,
+    // the ViT and the head through the ternary kernels below, and the graph that
+    // is left behind is glue the CPU backend runs perfectly well. That case keeps
+    // the CPU backend it has always had - deliberately, because routing it to
+    // ggml-cuda or ggml-sycl instead would change a path that is measured and
+    // shipping, to no purpose.
+    //
+    // A dense or block-quantised checkpoint asks for none of that. Every op in
+    // this file's graphs is stock ggml, so it can run wherever the build can run,
+    // and that is what lets BitVLA reach OpenVINO like the other ten archs
+    // instead of being the one that never arrives. See docs/backend/ov.md.
+    if (m->kernels_drive) {
+        m->backend = ggml_backend_cpu_init();
+        if (!m->backend) {
+            std::fprintf(stderr, "vla(bitvla): ggml_backend_cpu_init failed\n");
+            return nullptr;
+        }
+        ggml_backend_cpu_set_n_threads(m->backend, m->n_threads);
+        std::printf("vla(bitvla): ggml backend = CPU (%d threads) - GPU LM module activates below if available\n", m->n_threads);
+    } else {
+        m->backend = backend_init("vla(bitvla)", m->n_threads).handle;
+        if (!m->backend)
+            return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(m->backend, m->n_threads);
-    std::printf("vla(bitvla): ggml backend = CPU (%d threads) - GPU LM module activates below if available\n", m->n_threads);
 
     ggml_init_params wp = {  (size_t) 32*1024*1024,  nullptr,  true };
     m->ctx_weights = ggml_init(wp);
@@ -692,21 +779,22 @@ std::unique_ptr<ModelArchBase> bitvla_create(const std::string& mmproj_path,
 
     std::printf("vla(bitvla): weights resident in %.2f GiB (%s); image_id=%d proprio_id=%d action_begin_id=%d stop_id=%d\n",
                 ggml_backend_buffer_get_size(m->weight_buf)/(1024.0*1024.0*1024.0),
-                m->packed_int2 ? "int2-packed + F32 sidecars"
-                               : (m->matmul_type == GGML_TYPE_F32 ? "F32" : "BF16"),
+                m->packed_int2 ? "int2-packed + F32 sidecars" : resident,
                 m->image_token_id, m->proprio_pad_id, m->action_begin_id, m->stop_id);
 
 #ifndef VLA_BITVLA_GPU_KERNELS
     if (m->packed_int2) {
         std::fprintf(stderr, "vla(bitvla): int2-packed GGUF requires a GPU kernel build "
-                             "(VLA_BITVLA_GPU_KERNELS: CUDA or SYCL); use the bf16 GGUF for CPU.\n");
+                             "(VLA_BITVLA_GPU_KERNELS: CUDA or SYCL); for CPU, GPU and "
+                             "OpenVINO use a bf16, q8_0 or q4_0 GGUF "
+                             "(scripts/transcode_bitvla_int2.py).\n");
         return nullptr;
     }
 #endif
 
 #ifdef VLA_BITVLA_GPU_KERNELS
 
-    if ((m->packed_int2 || m->matmul_type == GGML_TYPE_F32) && !vla::env_flag("VLA_BITVLA_NO_CUDA_LM")) {
+    if (m->kernels_drive) {
         const int dev_count = vla_dev_count();
         if (dev_count > 0 && vla_dev_set(0) == 0) {
 

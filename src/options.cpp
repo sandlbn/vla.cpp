@@ -25,6 +25,10 @@ namespace vla {
 
 namespace {
 
+// f32 and bf16 only, on purpose, and quantised checkpoints do not widen this.
+// A quantised tensor keeps whatever type the GGUF stores it in
+// (gguf_reader::resident_type), so --weight-dtype never had any say over it;
+// this flag only ever chose what the tensors the file stores *dense* convert to.
 bool parse_dtype(const std::string & v, ggml_type & out) {
     if (v == "f32"  || v == "fp32")  {
         out = GGML_TYPE_F32;
