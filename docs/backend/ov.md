@@ -281,6 +281,17 @@ Pro B70, 10 LIBERO-object tasks x 5 episodes, GPU plugin at F16 (job 372759):
 | q8_0 | 3.34 GiB | 1.06 | 49/50 = 98.0% | 16.2 |
 | q4_0 | **2.24 GiB** | 0.64 | **50/50 = 100.0%** | 17.1 |
 
+![BitVLA weight flavours on the B70](../img/bitvla_ov_quant_b70.png)
+
+The figure separates two wins that are easy to conflate. Latency is entirely the
+`f32 -> f16` step, a compute-precision change; footprint is entirely the
+`f16 -> q4_0` step, a weight-format change, across which latency is flat.
+Neither buys the other. The memory panel is stacked because peak process RSS
+*contains* the weights: what sits above them is a constant ~2 GiB that no weight
+format touches. All five success intervals overlap, so the honest reading is
+that this sweep did not resolve a success difference between the arms - not that
+q4_0 is better than bf16. Redraw it with `ci/slurm/plot_ov_quant.sbatch`.
+
 The three arms are within one episode of each other, and the single miss in the
 bf16 and q8_0 arms is the *same* task in both - task difficulty, not a precision
 effect. That is the expected result rather than a lucky one: on ternary weights

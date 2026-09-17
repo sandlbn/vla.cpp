@@ -293,6 +293,24 @@ for arm in $ARMS; do
 done
 
 echo
+echo "=== plot ==="
+# Arms in the order given, which is the ladder order: the panels are read left to
+# right as decreasing weight width, and sorting them by score would destroy that.
+# Extra arms from earlier sweeps under the same OUTPUT_ROOT can be prepended with
+# PLOT_EXTRA_ARMS, which is how the dense f32/f16 reference bars get into the
+# figure without re-running them.
+PLOT_ARMS=()
+for a in ${PLOT_EXTRA_ARMS:-}; do PLOT_ARMS+=(--arm "$a"); done
+for arm in $ARMS; do
+  w="$(arm_weight "$arm")"
+  PLOT_ARMS+=(--arm "$w=$OUTPUT_ROOT/bitvla-ov-$w-$(arm_prec "$arm")")
+done
+"$VENV_PY" "$REPO_DIR/scripts/plot_ov_quant.py" "${PLOT_ARMS[@]}" \
+    --out "$REPO_DIR/docs/img/bitvla_ov_quant_b70" \
+    --title "BitVLA weight flavours on OpenVINO GPU, LIBERO object, Arc Pro B70" ||
+    echo "  (plot failed -- the numbers above still stand)"
+
+echo
 echo "REFERENCE: bf16:f16 scored 100.0% over 10 tasks at 16.0 ms/step (job 372740),"
 echo "           with the weights resident dense. A block-quantised arm that holds"
 echo "           that success rate at a smaller resident figure is the whole point;"
