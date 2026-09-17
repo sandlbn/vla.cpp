@@ -8,6 +8,44 @@ WORK_DIR="${SCRIPT_DIR}/.openvino_install_work"
 OS_ID=""
 OS_VERSION=""
 
+# --prefix mode. The default path here installs GPU and NPU drivers as root and
+# drops the runtime in /opt/intel, which is the right thing on a machine you own
+# and impossible on a shared cluster: no sudo, no apt, and the drivers already
+# provided by the site (on ours, /swtools/intel-gpu). --prefix fetches and
+# unpacks *only* the runtime archive, into a directory you can write.
+#
+# The archive is still Ubuntu-built, because that is the only flavour Intel
+# publishes; it runs on other glibc-compatible distributions, which is why
+# --ubuntu exists to choose one when /etc/os-release is not Ubuntu at all.
+PREFIX=""
+SUDO="sudo"
+UBUNTU_OVERRIDE=""
+
+usage() {
+  cat <<'EOF'
+install_ov.sh -- OpenVINO runtime, and on Ubuntu the GPU/NPU drivers too.
+
+  install_ov.sh                        full install: drivers + runtime in
+                                       /opt/intel, needs sudo, Ubuntu only
+  install_ov.sh --prefix ~/intel       runtime only, no sudo, no apt, any distro
+  install_ov.sh --prefix ~/intel --ubuntu 24.04
+                                       same, choosing the archive flavour when
+                                       the host is not Ubuntu
+
+Options:
+  --prefix DIR     install the runtime under DIR (implies runtime-only, no sudo)
+  --ubuntu VER     22.04 or 24.04; which archive to fetch. Required with
+                   --prefix on a non-Ubuntu host.
+  -h, --help       this
+
+Environment: OPENVINO_VERSION, OPENVINO_BUILD, INSTALL_ROOT (overridden by
+--prefix). With a version override the mirror's published checksum is used
+instead of the digest pinned in this script.
+
+After a --prefix install:  source DIR/openvino/setupvars.sh
+EOF
+}
+
 log() {
   printf '[install_openvino_runtime] %s\n' "$*"
 }
@@ -72,15 +110,20 @@ detect_os() {
 
 prepare_common_tools() {
   need_cmd bash
-  need_cmd sudo
-  need_cmd apt-get
-  need_cmd wget
   need_cmd curl
   need_cmd tar
-  need_cmd dpkg
   need_cmd sha256sum
-  need_cmd find
-  need_cmd sort
+
+  # Only the driver-package path needs these, and demanding them in --prefix
+  # mode would fail on exactly the hosts --prefix exists for.
+  if [[ -z "${PREFIX}" ]]; then
+    need_cmd sudo
+    need_cmd apt-get
+    need_cmd wget
+    need_cmd dpkg
+    need_cmd find
+    need_cmd sort
+  fi
 
   mkdir -p "${WORK_DIR}"
 }
@@ -216,7 +259,7 @@ install_runtime_2204() {
   fi
 
   log "Installing OpenVINO runtime for Ubuntu 22.04..."
-  sudo mkdir -p "${install_root}"
+  ${SUDO} mkdir -p "${install_root}"
   mkdir -p "${download_dir}"
 
   curl -fL "${openvino_url}" --output "${archive_path}"
@@ -224,9 +267,9 @@ install_runtime_2204() {
   rm -rf "${download_dir:?}/${openvino_dirname}"
   tar -xf "${archive_path}" -C "${download_dir}"
 
-  sudo rm -rf "${install_dir}"
-  sudo mv "${download_dir}/${openvino_dirname}" "${install_dir}"
-  sudo ln -sfn "openvino_${openvino_version}" "${symlink_path}"
+  ${SUDO} rm -rf "${install_dir}"
+  ${SUDO} mv "${download_dir}/${openvino_dirname}" "${install_dir}"
+  ${SUDO} ln -sfn "openvino_${openvino_version}" "${symlink_path}"
 
   if [[ ! -f "${symlink_path}/setupvars.sh" ]]; then
     echo "Error: ${symlink_path}/setupvars.sh was not found after installation." >&2
@@ -336,7 +379,7 @@ install_runtime_2404() {
   fi
 
   log "Installing OpenVINO runtime for Ubuntu 24.04..."
-  sudo mkdir -p "${install_root}"
+  ${SUDO} mkdir -p "${install_root}"
   mkdir -p "${download_dir}"
 
   curl -fL "${openvino_url}" --output "${archive_path}"
@@ -344,9 +387,9 @@ install_runtime_2404() {
   rm -rf "${download_dir:?}/${openvino_dirname}"
   tar -xf "${archive_path}" -C "${download_dir}"
 
-  sudo rm -rf "${install_dir}"
-  sudo mv "${download_dir}/${openvino_dirname}" "${install_dir}"
-  sudo ln -sfn "openvino_${openvino_version}" "${symlink_path}"
+  ${SUDO} rm -rf "${install_dir}"
+  ${SUDO} mv "${download_dir}/${openvino_dirname}" "${install_dir}"
+  ${SUDO} ln -sfn "openvino_${openvino_version}" "${symlink_path}"
 
   if [[ ! -f "${symlink_path}/setupvars.sh" ]]; then
     echo "Error: ${symlink_path}/setupvars.sh was not found after installation." >&2
@@ -359,13 +402,17 @@ install_runtime_2404() {
 run_installation() {
   case "${OS_VERSION}" in
     22.04)
-      install_gpu_2204
-      install_npu_2204
+      if [[ -z "${PREFIX}" ]]; then
+        install_gpu_2204
+        install_npu_2204
+      fi
       install_runtime_2204
       ;;
     24.04)
-      install_gpu_2404
-      install_npu_2404
+      if [[ -z "${PREFIX}" ]]; then
+        install_gpu_2404
+        install_npu_2404
+      fi
       install_runtime_2404
       ;;
     *)
@@ -375,7 +422,81 @@ run_installation() {
   esac
 }
 
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --prefix)
+        [[ $# -ge 2 ]] || { echo "Error: --prefix needs a directory." >&2; exit 1; }
+        PREFIX="$2"
+        shift 2
+        ;;
+      --prefix=*)
+        PREFIX="${1#*=}"
+        shift
+        ;;
+      --ubuntu)
+        [[ $# -ge 2 ]] || { echo "Error: --ubuntu needs 22.04 or 24.04." >&2; exit 1; }
+        UBUNTU_OVERRIDE="$2"
+        shift 2
+        ;;
+      --ubuntu=*)
+        UBUNTU_OVERRIDE="${1#*=}"
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        echo "Error: unknown argument '$1'." >&2
+        usage >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  if [[ -n "${PREFIX}" ]]; then
+    # mkdir now rather than at unpack time: a prefix you cannot write is the
+    # likeliest way to use this flag wrong, and finding out after a 400 MB
+    # download is a poor way to be told.
+    mkdir -p "${PREFIX}" || { echo "Error: cannot create --prefix '${PREFIX}'." >&2; exit 1; }
+    PREFIX="$(cd "${PREFIX}" && pwd)"
+    INSTALL_ROOT="${PREFIX}"
+    SUDO=""
+  elif [[ -n "${UBUNTU_OVERRIDE}" ]]; then
+    echo "Error: --ubuntu only applies with --prefix; the driver packages are" >&2
+    echo "       matched to the running system and cannot be chosen." >&2
+    exit 1
+  fi
+}
+
 main() {
+  parse_args "$@"
+
+  if [[ -n "${PREFIX}" ]]; then
+    # No apt, no /etc/os-release contract: only the archive flavour matters.
+    OS_VERSION="${UBUNTU_OVERRIDE:-}"
+    if [[ -z "${OS_VERSION}" ]]; then
+      if [[ -f /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        source /etc/os-release
+        [[ "${ID:-}" == "ubuntu" ]] && OS_VERSION="${VERSION_ID:-}"
+      fi
+    fi
+    if [[ -z "${OS_VERSION}" ]]; then
+      echo "Error: not running Ubuntu, so the archive flavour cannot be inferred." >&2
+      echo "       Pass --ubuntu 22.04 or --ubuntu 24.04." >&2
+      exit 1
+    fi
+    prepare_common_tools
+    log "Runtime-only install under ${PREFIX} (Ubuntu ${OS_VERSION} archive, no sudo)."
+    run_installation
+    rm -rf "${WORK_DIR}"
+    log "OpenVINO runtime installed."
+    log "To load OpenVINO in current shell: source ${PREFIX}/openvino/setupvars.sh"
+    return
+  fi
+
   detect_os
   prepare_common_tools
   prepare_common_dependencies
@@ -383,9 +504,9 @@ main() {
   log "Detected Ubuntu ${OS_VERSION}."
   run_installation
   rm -rf "${WORK_DIR}"
-  
+
   log "All OpenVINO installation steps completed successfully."
-  log "To load OpenVINO in current shell: source /opt/intel/openvino/setupvars.sh"
+  log "To load OpenVINO in current shell: source ${INSTALL_ROOT:-/opt/intel}/openvino/setupvars.sh"
 }
 
 main "$@"
