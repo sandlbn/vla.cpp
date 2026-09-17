@@ -319,11 +319,49 @@ ternary ones, and stay bf16 - which also keeps quantised constants away from
 `GET_ROWS`.
 
 **Latency does not move**: 16.2-17.1 ms/step across a 2.4x range of resident
-size. Decode at this model size is not weight-bandwidth-bound on the B70, so the
-footprint win is a footprint win and nothing more. Worth knowing before anyone
-spends effort on native `element::u2`, which would buy another 1.6x on size
-against the same flat curve. For context the hand-written SYCL ternary kernels
-run the same workload at 22.7 ms/step and CUDA on an H100 at 23.4 ms.
+size. For context the hand-written SYCL ternary kernels run the same workload at
+22.7 ms/step and CUDA on an H100 at 23.4 ms.
+
+#### Why the latency is flat
+
+Two mechanisms produce an identical flat curve and they have opposite
+consequences, so this was measured rather than argued
+(`ci/slurm/bmg_ov_quant_why_flat.sbatch`, job 372827). Either the workload is
+compute-bound and shrinking weights genuinely cannot help, or the plugin expanded
+the u4/i8 constants back to f16 at compile time and every arm ran the same dense
+GEMM. Both shrink host RSS, because that is the ggml-side buffer either way; they
+differ only on the device, and device memory had never been read on this platform
+- `eval/client/benchmark.py` samples VRAM through `nvidia-smi`, so every
+`*.mem.json` here carries `peak_vram_mib: null`. `scripts/xpu_mem_sample.py`
+reads it from per-process DRM fdinfo instead:
+
+| arm | host weights | device VRAM | device GTT | ms/step |
+|---|---:|---:|---:|---:|
+| bf16 | 5.39 GiB | **4.99 GiB** | 4.77 GiB | 53.5 |
+| q8_0 | 3.34 GiB | **2.93 GiB** | 2.51 GiB | 55.3 |
+| q4_0 | 2.24 GiB | **1.85 GiB** | 1.32 GiB | 57.0 |
+
+Device memory tracks the weight format at a 2.69x spread, so
+`ConvertFullyConnectedToFullyConnectedCompressed` does fire and the weights are
+executed compressed. The flat curve is therefore the workload's own property:
+weight-only quantisation is a *decode* optimisation, and a VLA step is not a
+decode. It is prefill-shaped - a ViT over 256 patches and a prefill over hundreds
+of tokens, then an 8x7 action chunk - so at M ~ 300 rows each weight byte is
+amortised over ~300 MACs and the GEMMs are FLOP-limited, not bandwidth-limited.
+The `f32 -> f16` arm is the same finding from the other side: 37.5 -> 16.0 ms/step
+with the weights byte-identical (10.75 GiB resident in both), i.e. 2.3x for a pure
+compute-precision change.
+
+The latency column above carries the second confirmation. It rises monotonically
+with compression, +6.6% from bf16 to q4_0 - the cost of unpacking nibbles in the
+GEMM inner loop, which is free on a bandwidth-bound kernel because it hides behind
+memory stalls and is not free here because there are none to hide in. (Those
+absolute numbers are ~3x the sweep's because `predict_check` does a full forward
+per iteration with no KV reuse; only the across-arm comparison is meaningful, and
+it reproduces the flat curve on a second harness.)
+
+So native `element::u2` would buy another 1.6x on footprint and nothing on speed,
+and q4_0 is the right floor for this workload.
 
 ## What had to change
 
