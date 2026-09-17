@@ -17,6 +17,9 @@ _deps/
 # Models / data
 *.gguf
 *.bin
+# ...except the quantiser fixture, whose entire value is being frozen: the
+# bitvla_quant ctest compares ggml's C dequantiser against these exact bytes.
+!tests/data/*.bin
 *.safetensors
 *.pt
 *.pth
@@ -55,3 +58,6 @@ eval/sim/simpler/simpler_uv/
 
 # Slurm job output from ci/slurm/*.sbatch, written into the submit directory.
 slurm_*.out
+# Scratch from bmg_bitvla_int2_regress.sbatch: the two runs' actions, their
+# comparisons, and the saved copy of src/models/bitvla.cpp it swaps out.
+int2_regress_*
