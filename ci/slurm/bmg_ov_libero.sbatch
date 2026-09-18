@@ -68,6 +68,12 @@
 #   sbatch ci/slurm/bmg_ov_libero.sbatch
 #   N_EPISODES=2 sbatch ci/slurm/bmg_ov_libero.sbatch    # quicker shakedown
 #   ARMS="bf16:f16 bf16:f32" sbatch ci/slurm/bmg_ov_libero.sbatch   # Stage A
+#   ARMS="q4_0:f16 q4_0:f16:onaq" sbatch ci/slurm/bmg_ov_libero.sbatch
+#       the act_quant elision against its own baseline. This is the ONLY
+#       instrument that can price it: job 372927 showed the elision also costs
+#       104 of 340 BitLinears their dynamic quantiser, so 31% of them run
+#       activations unquantised, and neither the op profile nor the chunk-spread
+#       screen can say whether that matters. Reference is q4_0's 50/50.
 #
 # Knobs: N_EPISODES, ARMS, CKPT_DIR, BUILD_DIR, OV_ROOT, OUTPUT_ROOT, SMOKE=0.
 # =============================================================================
@@ -112,15 +118,50 @@ fail() { echo "VERDICT: FAILED $1"; echo "DONE"; exit 1; }
 
 # A bare arm is a precision on the bf16 checkpoint -- what ARMS meant before the
 # weight axis existed, so Stage A's invocations still mean what they meant.
+# A third field is the graph variant: weight:precision:variant, default "base".
+#   base  the shipping graph
+#   fc3   GGML_OPENVINO_FC_RANK3 -- the rank squeeze (Stage D, closed negative)
+#   onaq  fc3 plus GGML_OPENVINO_ACT_QUANT_ELIDE -- act_quant elided and the
+#         plugin's own dynamic quantiser left to derive the codes instead
 arm_weight() { case "$1" in *:*) echo "${1%%:*}";; *) echo "bf16";; esac; }
-arm_prec()   { case "$1" in *:*) echo "${1##*:}";; *) echo "$1";;     esac; }
+arm_prec()   { local r="${1#*:}"; case "$1" in *:*) echo "${r%%:*}";; *) echo "$1";; esac; }
+arm_var()    { case "$1" in *:*:*) echo "${1##*:}";; *) echo "base";; esac; }
+# Callers splice this into `env`. It is invoked inside $( ), so it CANNOT fail
+# the job from here -- a `fail` would exit only the subshell and leave the caller
+# running a mislabelled base arm. Validation is in the pre-flight loop below,
+# which runs in the main shell; keep the two lists in step.
+arm_env() {
+  case "$(arm_var "$1")" in
+    fc3)  echo "GGML_OPENVINO_FC_RANK3=1" ;;
+    onaq) echo "GGML_OPENVINO_FC_RANK3=1 GGML_OPENVINO_ACT_QUANT_ELIDE=1" ;;
+  esac
+}
 arm_ckpt()   { echo "$CKPT_DIR/$CKPT_STEM-$(arm_weight "$1").gguf"; }
+# The one place an arm's output directory is spelled. The variant is appended
+# only when it is not "base", so every earlier sweep's directory keeps its name
+# and PLOT_EXTRA_ARMS still resolves.
+arm_out() {
+  local o="$OUTPUT_ROOT/bitvla-ov-$(arm_weight "$1")-$(arm_prec "$1")"
+  [ "$(arm_var "$1")" = base ] || o="$o-$(arm_var "$1")"
+  echo "$o"
+}
+# Plot label: the weight flavour alone, unless a variant needs telling apart.
+arm_label() {
+  case "$(arm_var "$1")" in
+    base) arm_weight "$1" ;;
+    *)    echo "$(arm_weight "$1")/$(arm_var "$1")" ;;
+  esac
+}
 
 # Every checkpoint up front: an hour into a sweep is a bad time to learn that
 # the q4_0 transcode was never made.
 for arm in $ARMS; do
   c="$(arm_ckpt "$arm")"
   [ -f "$c" ] || fail "arm $arm: no checkpoint at $c -- run DTYPES=\"$(arm_weight "$arm")\" sbatch ci/slurm/bitvla_bf16_gguf.sbatch"
+  case "$(arm_var "$arm")" in
+    base|fc3|onaq) ;;
+    *) fail "arm $arm: unknown graph variant '$(arm_var "$arm")' (want: base fc3 onaq)" ;;
+  esac
 done
 
 [ -x "$VENV_PY" ] || fail "no LIBERO venv -- run eval/sim/libero/setup_libero.sh on the login node"
@@ -134,6 +175,10 @@ export OCL_ICD_VENDORS="${OCL_ICD_VENDORS:-/swtools/intel-gpu/latest/neo}"
 # Cached OpenVINO blobs reload a graph that computes the wrong thing
 # (docs/backend/ov.md); backend.h strips this unless VLA_ALLOW_OV_CACHE=1.
 unset GGML_OPENVINO_CACHE_DIR
+# The graph-variant vars come from the arm, never from the submitting shell: a
+# stale export would silently turn a "base" control into something else.
+unset GGML_OPENVINO_FC_RANK3
+unset GGML_OPENVINO_ACT_QUANT_ELIDE
 
 # The client generates its protobuf bindings at import time by shelling out to
 # protoc, so the compiler has to be on PATH and not merely linked into vla-server.
@@ -215,25 +260,32 @@ fi
 # would relink with whatever compiler the cache happens to name.
 run_arm() {   # $1 = arm, weight:precision
   local arm="$1"
-  local prec weight CKPT out
+  local prec weight var CKPT out
   prec="$(arm_prec "$arm")"
   weight="$(arm_weight "$arm")"
+  var="$(arm_var "$arm")"
   CKPT="$(arm_ckpt "$arm")"
-  out="$OUTPUT_ROOT/bitvla-ov-$weight-$prec"
+  # The variant is in the path only when it is not the shipping graph, so every
+  # earlier job's output directory keeps the name it had.
+  out="$(arm_out "$arm")"
+  # shellcheck disable=SC2207
+  local venv=($(arm_env "$arm"))
   echo
-  echo "########## bitvla / OpenVINO GPU / $weight weights / $prec compute ##########"
+  echo "########## bitvla / OpenVINO GPU / $weight weights / $prec compute / graph $var ##########"
   echo "CKPT: $CKPT  ($(du -h "$CKPT" | cut -f1))"
+  [ ${#venv[@]} -eq 0 ] || echo "GRAPH ENV: ${venv[*]}"
   # Cleared, not merged into: run_libero.sh writes one summary.txt per task and
   # never removes an old one, so a re-run at a different -n leaves the previous
   # episode count in place for every task it did not reach.
   rm -rf "$out"
   env GGML_OPENVINO_DEVICE=GPU \
       GGML_OPENVINO_GPU_PRECISION="$prec" \
+      "${venv[@]}" \
       BITVLA_CKPT="$CKPT" \
       SKIP_BUILD=1 BUILD_DIR="$BUILD_DIR" \
       bash "$REPO_DIR/eval/run_libero.sh" \
           -i "$MODELS_ROOT" -o "$out" -n "$N_EPISODES" -m bit \
-      || fail "SWEEP $prec"
+      || fail "SWEEP $arm"
 
   # An arm that quietly fell back to the CPU backend would produce a perfectly
   # respectable success rate while testing nothing this job exists to test.
@@ -255,8 +307,8 @@ for arm in $ARMS; do run_arm "$arm"; done
 echo
 echo "=== success rates ==="
 for arm in $ARMS; do
-  out="$OUTPUT_ROOT/bitvla-ov-$(arm_weight "$arm")-$(arm_prec "$arm")"
-  printf '%-12s ' "$arm"
+  out="$(arm_out "$arm")"
+  printf '%-18s ' "$arm"
   "$VENV_PY" - "$out" <<'PY'
 import glob, os, re, sys
 root = sys.argv[1]
@@ -286,8 +338,8 @@ done
 echo
 echo "=== footprint ==="
 for arm in $ARMS; do
-  out="$OUTPUT_ROOT/bitvla-ov-$(arm_weight "$arm")-$(arm_prec "$arm")"
-  printf '%-12s ' "$arm"
+  out="$(arm_out "$arm")"
+  printf '%-18s ' "$arm"
   grep -h "weights resident in" "$out/_server_logs/"*.log 2>/dev/null | tail -1 ||
       echo "(no loader line)"
 done
@@ -302,8 +354,7 @@ echo "=== plot ==="
 PLOT_ARMS=()
 for a in ${PLOT_EXTRA_ARMS:-}; do PLOT_ARMS+=(--arm "$a"); done
 for arm in $ARMS; do
-  w="$(arm_weight "$arm")"
-  PLOT_ARMS+=(--arm "$w=$OUTPUT_ROOT/bitvla-ov-$w-$(arm_prec "$arm")")
+  PLOT_ARMS+=(--arm "$(arm_label "$arm")=$(arm_out "$arm")")
 done
 "$VENV_PY" "$REPO_DIR/scripts/plot_ov_quant.py" "${PLOT_ARMS[@]}" \
     --out "$REPO_DIR/docs/img/bitvla_ov_quant_b70" \

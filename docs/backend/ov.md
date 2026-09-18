@@ -363,6 +363,510 @@ it reproduces the flat curve on a second harness.)
 So native `element::u2` would buy another 1.6x on footprint and nothing on speed,
 and q4_0 is the right floor for this workload.
 
+### Where the device time actually goes
+
+If the workload is compute-bound, the next question is what the compute is doing.
+`GGML_OPENVINO_PROFILE_OPS=1` dumps `ov::InferRequest::get_profiling_info()` -
+node identity and device time per primitive - and `scripts/ov_profile_bucket.py`
+buckets it. Run it with `ci/slurm/bmg_ov_profile_ops.sbatch`. q8_0, F16, 24 infer
+calls, 40986 node records, 234.24 ms attributed (job 372841):
+
+| node type | ms | % | nodes | kernel |
+|---|---:|---:|---:|---|
+| FullyConnectedCompressed | 110.78 | 47.3 | 2040 | `jit:gemm:any__f16` |
+| ReduceMean | 47.43 | 20.3 | 726 | `reduce_ref__f32` |
+| Multiply | 28.52 | 12.2 | 4734 | `generic_eltwise_ref` |
+| Convert | 9.45 | 4.0 | 3060 | `reorder_data_fast_b1__f32` |
+| FullyConnected | 9.37 | 4.0 | 210 | `jit:gemm:any__f16` |
+| everything else | 28.7 | 12.2 | | |
+
+**Use profiling info, not kernel names.** An earlier attempt (job 372831) read a
+unitrace kernel table, saw every matmul reported as `gemm_kernel`, and concluded
+the compressed `FullyConnected` did not exist. It does -
+`FullyConnectedCompressed`, `FullyConnected`, `Gemm` and `MatMul` are all
+*implemented by* oneDNN's `jit:gemm:any` micro-kernel, which emits one OpenCL
+kernel object under one name. A kernel name identifies an implementation, never a
+primitive, and the mapping is many-to-one.
+
+The same table withdraws a second claim: `act_quant` is `Abs` + `ReduceMax` +
+`Maximum` + `Power` + its share of `Multiply`, which totals **~5-7%**, not the
+~32% job 372831 credited it with from shapes and call counts. The independent
+SYCL profile's 8.0% agrees.
+
+#### RMSNorm is 20% of device time, in a reference kernel
+
+`ReduceMean` is `openvino/op/rms_norm.cpp` - the frontend hand-rolls RMSNorm as
+`Multiply -> ReduceMean -> Sqrt -> Divide -> Multiply`. `ov::pass::RMSFusion`
+would collapse that into one RMS primitive, but its pattern is written against
+`Power(x, 2)` while the frontend spells the square `Multiply(x, x)`, so it never
+matches and the reduction lands on `reduce_ref` - OpenVINO's generic *reference*
+reduction, at 42-119 us per node (the two values track the 2560 and 6912 row
+widths exactly). The control is in the same run: the ViT's LayerNorm, which
+OpenVINO does recognise, runs `mvn_gpu_bfyx_opt` at **3 us** per node while
+computing a mean *and* a variance over comparable data.
+
+`GGML_OPENVINO_RMS_FUSION` changes the spelling. It is **off by default**, and
+the reason is the most useful negative result in this file:
+
+| mode | route | job | outcome |
+|---|---|---|---|
+| 1 `on` | `Power(x,2)` so RMSFusion matches | 372851, 372854 | fuses, **-31.5% device time**, breaks at F16 |
+| 2 `wide` | explicit F32 `Convert`s around the norm | 372856 | folded away by F16 compression |
+| 3 `mark` | `ov::mark_as_precision_sensitive` | 372857 | attribute is non-copyable; the fusion drops it |
+| 4 `gemm` | reduction as `MatMul` | 372877, 372878 | **11.7x on the norm**, breaks at F16 for a *different* reason |
+| 5 `gemmw` | that `MatMul`, explicit F32 `Convert`s | 372879, 372880 | `Convert` inserted, then folded |
+| 6 `gemmp` | that `MatMul`, `Convert` + the mark | 372881, 372882 | mark **holds**; 735 ms - it widens the residual stream too |
+| 7 `gemms` | scale the square, undo it in the constant | 372883, 372884 | collapses; only ever protected the square |
+| 8 `gemmz` | scale, and never undo it in the mean | 372885, 372886 | collapses at s = 4, 8 **and 12** |
+
+Mode 1 is fast and correct *at F32*: `off vs on` at F32 moves the 56 normalised
+actions by max 0.0876 / mean 0.0184, **below** the 0.1155 / 0.0255 that the
+already-accepted F16-vs-F32 change moves them. At F16 it destroys the model. The
+evidence is not the 0.94 action delta beside it - BitVLA's decorrelation floor
+makes any large delta uninformative - but the **chunk spread**: the per-dimension
+standard deviation across the 8 action steps collapses from 0.0236 to **0.0036**,
+i.e. the policy emits nearly the same action eight times. Three healthy arms in
+the same run sat at 0.0223 / 0.0233 / 0.0236. Measure it with
+`ci/slurm/bmg_ov_rms_fusion_check.sbatch`; it is a screen, not a gate.
+
+Modes 2 and 3 failed identically, at 7.18-7.20 ms against mode 1's 7.20 and with
+the same collapsed spread, and the cause is below the graph.
+`rms_kernel_bfyx_opt` accumulates into `ACCUMULATOR_TYPE`, a **JIT constant the
+plugin derives from the tensor dtype**, and squares its terms with `native_powr`,
+a low-precision builtin. Summing 2560 or 6912 squares in F16 overflows outright
+once activations reach |x| ~ 10 against a 65504 ceiling - which is why the failure
+is a collapse rather than a drift. No graph-level attribute reaches a JIT
+constant. `reduce_ref__f32` was accidentally immune because OpenVINO's reference
+reduction has only an F32 implementation: the slow path was buying accuracy
+nobody had asked for, and naming the primitive took the accumulator with it.
+
+Mode 4 replaces `ReduceMean(x*x, -1)` with `MatMul(x*x, ones_K * 1/K)`. XMX/DPAS
+accumulates F16 x F16 into F32 *in hardware*, so the wide accumulator comes from
+the silicon rather than from an attribute `ConvertPrecision` may fold away, and
+RMSFusion is deliberately not invited because its pattern wants a `ReduceMean`.
+
+**On speed it is the best result in this file.** Job 372877: the norm goes
+47.12 ms / `ReduceMean/reduce_ref__f32` x 726 to **4.03 ms /
+`FullyConnected/jit:gemm:any__f16` x 726**, an 11.7x, carrying total device time
+230.37 -> **175.01 ms (-24.0%)**. `ConvertMatMulToFullyConnected` picks the
+reduction up as an ordinary FC, so the "N = 1 is a degenerate GEMM and will be
+bandwidth-bound" risk did not materialise. No `RMS` node type appears anywhere,
+so the F16 RMS kernel never enters the graph, which was the whole point. The cost
+side is +726 `FullyConnected` nodes (+4.0 ms) and +726 `Convert` (+4.6 ms).
+
+**And it still failed the numerics screen** - chunk spread **0.00000** at F16
+(job 372878), past mode 1's 0.0036: the action file is one 7-value action
+repeated eight times, character for character. The cause is visible in mode 4's
+own profile rather than inferred. The 726 `Multiply(x,x)` square nodes ran
+`eltwise_simple_vload8__f32` in the control arm and `eltwise_simple_vload8__f16`
+in mode 4. The plugin had been keeping the square wide **only because its
+consumer `reduce_ref` has an F32-only kernel**; replacing that consumer with an
+F16-capable `MatMul` removed the reason, `ConvertPrecision` compressed the square,
+and x2 overflows F16 above |x| = 255.
+
+That reading was itself wrong, and modes 5-8 are what refuted it. The record is
+worth keeping because each one failed differently.
+
+**Modes 5 and 6 - asking the plugin for F32.** Mode 5 adds mode 2's explicit
+`Convert`s to mode 4's GEMM, on the reasoning that mode 2 failed only because
+RMSFusion replaced the subgraph. Job 372880 shows the `Convert` count rising by
+exactly 726 - so it *was* inserted - while the square still ran `__f16`. Only the
+output-side `Convert` survived. **So RMSFusion was never what folded mode 2's
+`Convert`s**; `ConvertPrecision` declines an F32 `Convert` in an F16 inference
+graph on its own, with no fusion involved. Mode 6 then pins it with
+`mark_as_precision_sensitive`, where nothing can drop the attribute, and **it
+works exactly as documented**: `jit:gemm:any__f32` and
+`eltwise_simple_vload8__f32`. It also costs **735.77 ms against a 230.20 ms
+control**, because the mark disables compression on the subgraph *before* the
+marked input and that walk does not stop at the norm - the residual stream widens
+with it. Correct, and 3.2x slower than doing nothing.
+
+**Modes 7 and 8 - not asking for anything.** If `x2` overflows F16 above
+|x| = 255, square a scaled copy instead: with `y = x * 2^-s`,
+`mean(x2) = sum(y2) * 2^2s / K`, and the `2^2s` folds into the GEMM constant that
+was already `1/K`. Mode 7 does exactly that and collapses. But mode 7 folds the
+gain *back*, so its output is bit-identical to mode 4's - it only ever protected
+the per-element square. Mode 8 therefore carries `2^-2s` all the way through and
+cancels it in the `eps` and reciprocal constants, which are constant-folded, so it
+costs the same one `Multiply`. **Mode 8 has the best F32 agreement of any mode
+tried** (max 0.038 / mean 0.0079 against the control's 0.0915 / 0.0256), so the
+algebra is right. At F16 it collapses at s = 4, at s = 8, and at s = **12** -
+headroom to |x| = 1.0e6.
+
+**So it is not overflow, and the scaling family is refuted.** The evidence that
+settles it is simpler than any of the above: the F16 action files from modes 4, 5,
+7 and 8 are **byte-identical** (`a1cf9de5...`), across graphs with materially
+different arithmetic and three different constants. Four different computations
+cannot agree to the last bit unless the norm's output is exactly zero, at which
+point every mode's scaling multiplies zero and gets zero. At F32 the same modes
+differ from each other exactly as their arithmetic predicts.
+
+**The cause, job 372887.** Profiling mode 4 at F32 shows the *same* primitive as
+at F16 - `FullyConnected` x726, from the same
+`ConvertMatMulToFullyConnected` - differing only in the kernel's element type:
+
+| arm | primitive | norm ms | result |
+|---|---|---:|---|
+| gemm @ F32 | `FullyConnected/jit:gemm:any__f32` | 6.13 | correct |
+| gemm @ F16 | `FullyConnected/jit:gemm:any__f16` | 4.03 | **all zeros** |
+
+Same node type, same shapes, same graph, same constant - only the element type
+differs, and one of them returns zeros for every input magnitude from `x` to
+`x * 2^-12`. **`jit:gemm:any__f16` at N = 1 does not compute this reduction on
+this plugin.** That is the plan's "N = 1 is a degenerate GEMM" risk arriving as a
+wrong answer rather than as a slow one, and no graph-level change fixes it: every
+mode from 5 to 8 was buying precision for a kernel that was not multiplying.
+
+**Where this leaves RMSNorm.** The route is fast (11.7x on the norm, -24.0% total
+device time) and *correct at F32*, which is not a usable combination because F32
+inference is itself 2.3x slower. `GGML_OPENVINO_RMS_FUSION` stays **off by
+default** in all eight modes. The untried mitigation is the one the plan already
+names - make the GEMM non-degenerate by reducing in two stages, or pad the
+constant to `{K, 8}` and slice - and it is worth trying precisely because the
+speed result is real and the only thing wrong is N = 1.
+
+#### Mode 9: stop arguing with the JIT and write the kernel
+
+Modes 1-8 share one shape: each tries to make *the plugin's* kernel accumulate
+wide, from the graph. Reading the kernel settles why none of them could. The
+plugin embeds its OpenCL sources as strings in
+`libopenvino_intel_gpu_plugin.so`, and `rms_gpu_bfyx_opt` extracted from it
+reduces like this:
+
+```c
+ACCUMULATOR_TYPE rms = ACCUMULATOR_VAL_ZERO;
+rms += native_powr(tmp, 2);
+```
+
+`ACCUMULATOR_TYPE` is a **JIT constant the plugin derives from the tensor
+dtype**. There is no graph-level attribute that reaches a JIT constant, so an
+explicit `Convert`, `mark_as_precision_sensitive` and three scaling schemes were
+all addressing the wrong layer of the stack. At F16 a 2560- or 6912-wide sum of
+squares does not drift, it *overflows*: the ceiling is 65504 and |x| around 10 is
+enough, which is why the failure was always a collapse rather than a degradation.
+
+Mode 9 supplies the kernel instead. `ci/kernels/ggml_ov_meansq.cl` is that same
+algorithm - one work-group per row, sub-group block reads, `sub_group_reduce_add`,
+an SLM reduction across sub-groups - with three deliberate changes: the
+accumulator is `float` unconditionally, `t*t` with `fma()` replaces
+`native_powr(t, 2)`, and there is no private `data[]` row cache because this
+kernel only reduces, so occupancy is not capped by row width.
+
+It reaches the device as a **GPU CustomLayer** (`ci/kernels/ggml_ov_meansq.xml`,
+selected by `GGML_OPENVINO_CUSTOM_KERNELS`, which the backend turns into the
+plugin's `CONFIG_FILE`). Note the plugin binds these by **op type name**, so the
+`GgmlRmsRecip` op the frontend emits and the descriptor's `name=` are one
+contract.
+
+**Job 372899 proved the mechanism before any of it was wired**, via
+`tests/probe_ov_custom_rms.cpp`, which answers five unknowns in one job: an op
+type OpenVINO has never heard of survives the whole transformation pipeline;
+`CreateCustomOp` runs before the plugin's own op factory; `INPUT0_DIMS`,
+`INPUT0_TYPE` and `OUTPUT0_TYPE` all exist under those spellings; the
+`B*F*Y*X*LWS` WorkSizes formula parses; and a custom op's output element type may
+differ from its input's. The third of those is what keeps mode 9 to **one
+descriptor for all 726 nodes** rather than one per distinct K.
+
+| variant | bound | max rel vs double | note |
+|---|---|---:|---|
+| control, `Multiply` + `ReduceMean` | yes | 4.886e-04 | what mode 9 replaces |
+| V1, `INPUT0_DIMS` + element types | yes | **2.815e-07** | what ships |
+| V2, dims only, types hardcoded | yes | 2.815e-07 | |
+| V3, all static via `<Define>` | yes | 2.815e-07 | |
+
+Three orders of magnitude, which is the `float` accumulator doing what six modes
+of graph surgery could not ask for.
+
+**The probe deliberately reports no speed result.** It was re-run at 16x the rows
+(job 372908) to find out whether its 1.1x meant anything; fitting the two points
+gives 0.057 ms fixed and 3.14e-04 ms/row, i.e. **16.3 GB/s, 3.6% of this device's
+456 GB/s** and almost exactly PCIe for the 21 MB it copies. The probe hands
+`set_input_tensor` a host-allocated tensor, so every infer moves the input across
+the bus and both arms pay it equally. Raising the row count buys more PCIe, not
+more kernel. Mode 9's speed is the OVPROF table's business on the real model,
+where the tensors are already resident and `ReduceMean` costs 47.12 ms over 726
+nodes.
+
+**The first wiring of it onto the real model failed twice, and the two failures
+between them determined what the kernel has to return.** The op as first written
+was `GgmlMeanSq`: one input, output the mean of the squares, `Add(eps)`, `Sqrt`
+and `Divide` left downstream untouched. Neither output type works.
+
+| job | op's output type | what happened |
+|---|---|---|
+| 372910 | `f32`, hardcoded | total device time 230.80 ms -> **8971.05 ms**. `Convert` alone 8758.25 ms / 97.63% / 3786 nodes |
+| 372911 | follows the input | `Convert` still 8771.98 ms, node count 3786 -> **4512** |
+| 372912 | follows the input (= `f16`) | numerics gate FAILED, chunk spread **0.00000** against a healthy 0.02164 |
+
+372910 is one op declaration pinning a whole subgraph: `set_output_type(f32)`
+holds `Add`/`Sqrt`/`Divide`/`Multiply` at f32, so `ConvertPrecision` has to
+compress each norm's **full `{rows, K}` output** back to f16 on the way out -
+726 `Multiply_*_compressed_to_f16` records at ~22.9 ms each. The one-line "fix"
+of following the input type did not help and made it worse: 372911 grew whole
+buckets the control arm does not contain at all (`Multiply_*` 4128 ms / 180,
+`Add_*` 3056 ms / 678, `Reshape_*` 1477 ms / 324), plus 726
+`rmsmeansq_*_decompressed_to_f32`. An opaque op repeated 726 times is enough to
+wreck the plugin's precision plan whichever type it declares.
+
+372912 is the other end of the same vice. With the output f16, a spread of
+*exactly* zero is the signature of `mean = inf -> 1/sqrt(inf) = 0`: a direct
+measurement that **`mean(x²)` exceeds f16's 65504 on this model**, which is the
+ceiling job 372883 first localised and job 372887 had cast doubt on.
+
+So the value that leaves the kernel has to be f32-safe in magnitude *and*
+f16-typed in storage, and there is exactly one quantity in this chain that is
+both. It is the one the plugin's own kernel stores:
+
+```c
+slm_buf[0] = native_powr(sqrt(rms + TO_ACCUMULATOR_TYPE(EPSILON)), -1);
+```
+
+`1/sqrt(mean + eps)` runs about 1e-3 to 1e-1 here - five orders from f16's
+ceiling and five from its 6e-8 subnormal floor. The shipped entry point is
+therefore **`ggml_ov_rrms`**, replacing five nodes per norm rather than two:
+`Multiply(x,x)`, `ReduceMean`, `Add(eps)`, `Sqrt` and the `Divide`. `eps` arrives
+as a **second input tensor**, not a `<Define>`, so one descriptor still covers
+every node; as a define it would have to be baked per eps value and the
+descriptor generated at runtime.
+
+Two differences from the plugin's line above are deliberate. The sum reaching it
+was accumulated in `float`, not in `ACCUMULATOR_TYPE` - the point of the whole
+file. And the reciprocal is a real divide rather than `native_powr(x, -1)` or
+`rsqrt()`: both are low-precision builtins, this value multiplies every element
+of the row, and one divide per row is not worth trading precision for.
+
+**The probe was extended to the two-input form before any of it went near the
+model again, and job 372913 failed in a way worth recording.** Splitting the
+`.cl` into a shared reduction plus two entry points made *every* descriptor stop
+binding, including the three that had passed twice:
+
+```
+[GPU] Check 'kernels.size() == batch.kernels_counter' failed at
+      kernels_cache.cpp:314
+```
+
+**cldnn builds one program per CustomLayer and asserts it contains exactly one
+kernel.** A second `__kernel` in the same source is not diagnosed as such - the
+error names neither the file nor the surplus kernel, and the standalone OpenCL
+stage reported the source as valid at the same moment. `MS_ENTRY` now selects
+the entry point at compile time. (Variant 1 also died at *"unknown type name
+`INPUT1_TYPE`"*: that define exists only when the descriptor declares a second
+input.)
+
+Job 372915, after the fix, answers both questions the rrms form raises:
+
+| | bound | max rel vs double |
+|---|---|---:|
+| control, `Multiply` + `ReduceMean` | yes | 4.786e-04 |
+| V1 / V2 / V3, `ggml_ov_meansq` | yes | 2.047e-07 |
+| **`ggml_ov_rrms(x, eps)`, f16 out** | **yes** | **3.521e-04** |
+
+A CustomLayer takes a second input and the plugin gives a **folded Constant** its
+own buffer, so `eps` can be a tensor. And `1/sqrt(mean + eps)` survives f16
+storage: 3.521e-04 is *below one f16 ulp* (2⁻¹¹ = 4.9e-04), so essentially all of
+it is the result being stored in f16 and none of it is the accumulator - against
+job 372912, where storing the *mean* in f16 gave not a large error but zero.
+
+**And then it fails on the model, for a reason that is still unexplained.** The
+op is correct in isolation on every axis the probe can reach, and the model run
+is a disaster (job 372916):
+
+| | control, `off` | `rrms` |
+|---|---:|---:|
+| norm reduction | 47.16 ms `ReduceMean/reduce_ref__f32` x726 | 46.74 ms `GgmlRmsRecip/undef` x726 |
+| total device | 230.30 ms | **8934.93 ms** |
+
+Job 372917's screen agrees the answers are wrong: chunk spread 0.02120 -> 0.00216.
+
+The 8.9 s is **not** the custom op. The profile attributes it to `Convert`, and
+only 30 *distinct* names are expensive, each run 6 times at ~23 ms as
+`reorder_data_fast_b1__f32`:
+
+```
+    4134.8 ms   900  Multiply_N_node_N#N_compressed_to_fN
+    2955.0 ms   666  Add_N_node_N#N_compressed_to_fN
+    1477.7 ms   324  Reshape_N_N#
+       0.6 ms   720  rmsrecip_node_N#N_decompressed_to_fN
+```
+
+The op's own output conversion is 0.6 ms over 720 nodes. It is the **consumer**
+that reorders, and no probe stage has ever built a consumer - which is what
+`run_rrms_chain()` in `tests/probe_ov_custom_rms.cpp` exists to do.
+
+**Job 372925 found the cause: a CustomGPUPrimitive is a layout fence.** The probe
+had never built the op's *consumer*, and `run_rrms_chain()` does - a three-op
+model, `Parameter -> GgmlRmsRecip -> Multiply -> Result`, dynamic shapes, printed
+back as the plugin compiled it:
+
+```
+Input -> Reorder -> CustomGPUPrimitive -> Reorder -> Eltwise -> Reorder -> Result
+```
+
+**Three reorders around three ops.** cldnn cannot propagate layout or precision
+through a custom primitive and cannot fuse post-ops into it, so it fences the op
+on both sides and again before the result. Multiply that by 726 nodes at full
+tensor size and it is the 8.9 s - and it is why job 372916's expensive Converts
+carry *consumer* names (`Multiply_N_node_N#N_compressed_to_fN`): the reorder that
+follows the op is attributed to whatever consumes it.
+
+The numerics were never the issue. The chain is correct at max rel 8.292e-04,
+about 2x the standalone 3.521e-04 and entirely the extra f16 rounding of the
+multiply. **The kernel is fine; the mechanism is not.** Mode 9 stays off by
+default, and any future attempt has to answer the fence, not the kernel.
+
+(Caveat on the evidence: the probe prints the runtime model for the chain only,
+not for the `Multiply+ReduceMean` control, so the control has not been shown
+reorder-free *at probe scale*. What supports it is the model profile - the
+control arm's whole `Convert` bucket is 9.17 ms against the rrms arm's 8747 ms.
+Printing the control's runtime model too is a one-line change and should be the
+first thing done if this is revisited.)
+
+One explanation was proposed and **refuted**: that the LM graphs are dynamic
+(`{1,1,-1,-1}`) while every probe stage had been static. Job 372918 built the
+descriptor under a dynamic `PartialShape` and it binds and is correct at the same
+3.521e-04 as static. `INPUT0_DIMS[3]` and the `B*F*Y*X*LWS` WorkSizes formula do
+track a runtime shape.
+
+#### The prize is the same size on q4_0, the flavour that ships
+
+![q4_0 against q8_0 on the B70](../img/bitvla_ov_q4_vs_q8_b70.png)
+
+Regenerate with:
+
+```bash
+python3 scripts/plot_ov_q4_vs_q8.py \
+    --arm q8_0=outputs/ov_prof_ops_372916/q8_0.rms-off.fc-off.bucket.txt \
+    --arm q4_0=outputs/ov_prof_ops_372919/q4_0.rms-off.fc-off.bucket.txt \
+    --numerics slurm_bmg_ov_rms_chk_372879.out \
+    --numerics slurm_bmg_ov_rms_chk_372921.out \
+    --out docs/img/bitvla_ov_q4_vs_q8_b70
+```
+
+The left panel is **shares, not milliseconds**, and that is a correctness
+constraint rather than a presentation choice - see the script's docstring.
+
+Every measurement in this section was taken on q8_0, because both gate scripts
+default to it. q4_0 is what Stage B recommends (2.24 GiB, 50/50 tasks). Job
+372919 profiled the control on q4_0, and the two are the same graph:
+
+| bucket | q8_0 (372877) | q4_0 (372919) |
+|---|---:|---:|
+| `FullyConnectedCompressed` | 47.39% / 2040 nodes | 47.95% / 2040 nodes |
+| `ReduceMean` `reduce_ref__f32` | 20.45% / 726 | 20.35% / 726 |
+| FC kernel | `jit:gemm:any__f16` | `jit:gemm:any__f16` |
+
+Compare **shares, not totals** - `enable_profiling` perturbs absolute device time,
+so totals are meaningful only within one job. Three consequences:
+
+- **q4_0's `u4` weights get no primitive of their own.** Same kernel, same node
+  count; oneDNN decompresses inside the GEMM either way. The nibble unpacking
+  visible as Stage B's +6.6% never becomes a separate bucket, so there is nothing
+  flavour-specific to optimise in the FC column.
+- **The RMSNorm prize transfers unchanged**, 20.35% against 20.45%. Modes 1-5 and
+  mode 9 do not need re-running on q4_0; they would fail identically, for reasons
+  that are properties of the graph and not of the weight encoding.
+- **Integer compute is worse on q4_0, not better.** Stage D's int8 path bought
+  5.06 ms against the dynamic quantiser's own 8.18 ms on q8_0's *symmetric* i8.
+  q4_0's `u4` + zero-point must upconvert first, so it starts further behind. It
+  stays closed without spending a job.
+
+The *screen* was q8_0-calibrated too, and job 372921 checked that it transfers:
+
+| arm | chunk spread | f16 vs f32 |
+|---|---:|---:|
+| q4_0/rms-off/f16 | 0.02438 | max 0.057836 / mean 0.011294 |
+| q4_0/rms-off/f32 | 0.02136 | |
+| q8_0/rms-off/f16 (372879) | 0.02093 | max 0.095910 / mean 0.022526 |
+
+q4_0's two arms bracket the 0.022-0.024 healthy band, so no per-flavour re-keying
+is needed. Its f16-vs-f32 disagreement is **half** q8_0's, which makes the screen
+*conservative* on q4_0 rather than loose - a change that collapses the spread
+there has less headroom to hide in, not more.
+
+#### Integer compute: the plugin's int8 path, and why rank blocked it
+
+BitVLA is natively W1.58A8 and none of it was reaching int8 hardware. The GEMMs
+ran F16 x F16 on XMX with both operands carrying int8-valued data.
+`ov::hint::dynamic_quantization_group_size` is the documented route, and setting
+it changed nothing - twice, for two different wrong reasons.
+
+**The A/B had no contrast.** The hint defaults to `0`, and
+`ExecutionConfig::finalize_impl` promotes an unset-and-still-zero value to
+`UINT64_MAX` on systolic platforms. BMG reports `supports_immad`, so the "off"
+arm was already at `UINT64_MAX` and the "max" arm set the identical value.
+
+**The real blocker was tensor rank, in the plugin.**
+`DynamicQuantizeFullyConnected` is registered here, but its
+`pass_config->set_callback` skips any node with `input_rank > 3` - the plugin also
+carries the string *"[GPU] Dynamic quantization for 4D matmul is not
+implemented"*. The ggml frontend describes **everything** as rank 4
+(`ggml-decoder.cpp`: `{1,1,1,len}`, `{1,1,prefill_chunk,ctx}`, `{1,1,-1,-1}`), so
+no `FullyConnected` in this model had ever been a candidate, at any group size.
+Every other gate in that callback passes. The structural evidence is that the
+profile contains no `DynamicQuantize` node of any kind.
+
+`GGML_OPENVINO_FC_RANK3` (`openvino/op/mulmat.cpp`, off by default) squeezes the
+leading statically-1 axes off the activation operand of a MUL_MAT whose weight
+arrived as a rank-2 constant, and unsqueezes them back onto the result. Job
+372875 says the diagnosis was right: **2040 `DynamicQuantize` nodes** appear,
+`FullyConnectedCompressed` stays at 2040 nodes, and its kernel moves from
+`jit:gemm:any__f16` to `jit:gemm:any__i8`. Weight compression survives.
+
+It is still a net regression, 230.71 -> 241.81 ms, and the FC column is
+confounded:
+
+| bucket | off | on | delta | nodes |
+|---|---:|---:|---:|---|
+| FullyConnectedCompressed | 109.29 | 97.57 | -11.72 | 2040 -> 2040 |
+| Add | 0.03 | 9.99 | **+9.96** | 24 -> 1320 |
+| DynamicQuantize | 0.00 | 8.41 | +8.41 | 0 -> 2040 |
+| Convert | 9.25 | 15.02 | +5.77 | 3060 -> 4398 |
+| MatMul | 1.41 | 5.66 | +4.25 | 180 -> 360 |
+| Relu | 0.00 | 1.33 | +1.33 | 0 -> 180 |
+
+`Add` went from 24 to 1320 *executed* nodes and `Relu` from 0 to 180, while "not
+executed (fused or folded)" fell 22020 -> 19434. Those nodes were oneDNN
+**post-ops fused into `FullyConnectedCompressed`** in the off arm; the `Unsqueeze`
+on the MatMul output sits between the FC and its consumer and blocks post-op
+fusion. So 109.29 ms includes work that 97.57 ms does not, and whether the int8
+GEMM is faster at all is **not yet measured**. The same run also showed the first
+version of the gate over-firing: 180 activation x activation MUL_MATs carry a
+static 1 on axis 0, squeezed to rank 3, moved off the batched `Gemm` primitive
+onto `MatMul` at ~2x the time per node, and cost +3.9 ms for something
+`DynamicQuantizeFullyConnected` never looks at. The gate now requires the weight
+operand to be rank 2.
+
+**With the gate fixed, the answer is a clean negative.** Job 372877 re-ran it on
+both RMS axes, confirming `rank_b = 4 -> squeeze 0` so attention is untouched:
+
+| arm | DQ nodes | DQ ms | FC ms | total ms |
+|---|---:|---:|---:|---:|
+| q8_0 / rms-off / fc-off | 0 | 0.00 | 117.64 | 230.37 |
+| q8_0 / rms-off / fc-on | 2040 | 8.45 | 107.65 | 240.50 |
+| q8_0 / rms-gemm / fc-off | 0 | 0.00 | 111.46 | 175.01 |
+| q8_0 / rms-gemm / fc-on | 2040 | 8.18 | 106.27 | 192.73 |
+
+The `rms-gemm` rows are the readable ones, because subtracting mode 4's 726
+`rmsgemm` nodes from the FC column isolates the BitLinear GEMMs: **107.43 ->
+102.37 ms, a 5.06 ms saving against the dynamic quantiser's own 8.18 ms.** That is
+a net loss *before* post-op defusion is counted, not merely a disappointing win.
+So `GGML_OPENVINO_FC_RANK3` stays off, and the int8 path is closed as measured
+rather than as suspected.
+
+The ceiling was always small, and this is what it looks like from the inside: the
+whole FC bucket is 109 ms of 231, the quantiser takes 8.4 ms of it straight back,
+and the realised F16->i8 ratio is nothing like int8 XMX's 1.8-2.0x peak advantage
+(`docs/backend/sycl.md`, 251-258 TOPS vs 116-143 TFLOPS) because these GEMMs are
+not running anywhere near peak to begin with. What would pay for the quantiser is
+eliding `act_quant`'s now-redundant fake-quant chain (~10 ms) - a change to the
+model definition rather than the backend, and deliberately out of scope.
+
+Separately, job 372836 (`ci/slurm/bmg_probe_ocl_xmx.sbatch`) established that a
+hand-written kernel could reach XMX directly if it came to that: the B70 exposes
+`cl_intel_subgroup_matrix_multiply_accumulate`, and IGC compiles the intrinsic for
+i8 at M = 1/2/4/8 and bf16 at M = 1/8, subgroup 16.
+`cl_intel_subgroup_split_matrix_multiply_accumulate` is **not** available.
+
 ## What had to change
 
 Fifteen fixes: two in vla.cpp, thirteen in ggml's OpenVINO backend. Both
