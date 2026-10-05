@@ -223,6 +223,23 @@ Status: **runs, but BitVLA's LM produces NaN actions** - not usable yet.
   activations overflow f16. Evo-1 does not compile on the NPU driver
   (`vclAllocatedExecutableCreate2` invalid argument).
 
+### Vision encoder on the NPU (explored, not built)
+
+pi0's SigLIP tower alone is numerically clean on the NPU: run on the same
+input, its output matches an f32 CPU reference to 5e-4 relative max error
+(2e-4 RMS) - tighter than OpenVINO's GPU plugin at f16 - so the NaN above is
+Gemma's, not the vision tower's. At 58.6 ms per view it is no faster than the
+GPU (~54 ms through SYCL), so for one camera view there is nothing to gain. For
+two (LIBERO, and most real setups) there is: encoding the second view on the
+NPU while the GPU encodes the first takes vision from ~108 ms to ~59 ms per
+step, about 50 ms (~13%) off pi0's request, and leaves the GPU less loaded.
+
+The low-risk shape is two processes: an NPU vision worker from the OpenVINO
+build, and the SYCL policy fed that view's embedding through the existing
+precomputed-embedding input (`precomputed_img_emb`). One process would mean
+linking the OpenVINO runtime into the SYCL build, whose oneAPI TBB/OpenCL
+copies conflict with OpenVINO's (see ci/local/common.sh).
+
 ## Switches
 
 | variable | effect |
