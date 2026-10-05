@@ -223,7 +223,7 @@ Status: **runs, but BitVLA's LM produces NaN actions** - not usable yet.
   activations overflow f16. Evo-1 does not compile on the NPU driver
   (`vclAllocatedExecutableCreate2` invalid argument).
 
-### Vision encoder on the NPU (explored, not built)
+### Vision encoder on the NPU (prototype built - see [ptl_npu.md](ptl_npu.md))
 
 pi0's SigLIP tower alone is numerically clean on the NPU: run on the same
 input, its output matches an f32 CPU reference to 5e-4 relative max error

@@ -34,6 +34,10 @@
 #include "env_flag.h"
 
 #include <algorithm>
+#include <future>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -47,6 +51,45 @@
 #include <vector>
 
 namespace vla {
+
+namespace {
+// ---------------------------------------------------------------------------
+// Prototype: one camera view's vision encoder on the NPU (docs/backend/ptl.md).
+//
+// VLA_PI0_NPU_VISION=<unix socket> points at scripts/npu_vision_worker.py,
+// which serves pi0's SigLIP+projector graph (the IR ggml-openvino exports for
+// this model) on the OpenVINO NPU. With >= 2 views, the last view's
+// preprocessed CHW image is sent there and encoded in parallel with the GPU's
+// views. Wire format, native endianness: request = u32 n_floats + floats
+// (3x224x224), reply = u32 n_floats + floats (n_img_tokens x hidden), or
+// n_floats = 0 on failure. Any error falls back to encoding on the GPU.
+// ---------------------------------------------------------------------------
+bool npu_vision_roundtrip(const char * sock_path, const std::vector<float> & chw, float * out,
+                          size_t out_floats) {
+    const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", sock_path);
+    auto io_all = [&](bool wr, void * p, size_t n) {
+        char * c = static_cast<char *>(p);
+        while (n) {
+            const ssize_t k = wr ? ::write(fd, c, n) : ::read(fd, c, n);
+            if (k <= 0) return false;
+            c += k;
+            n -= (size_t) k;
+        }
+        return true;
+    };
+    bool ok = ::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0;
+    uint32_t n = (uint32_t) chw.size();
+    ok = ok && io_all(true, &n, sizeof(n)) && io_all(true, const_cast<float *>(chw.data()), chw.size() * sizeof(float));
+    uint32_t m = 0;
+    ok = ok && io_all(false, &m, sizeof(m)) && m == out_floats && io_all(false, out, out_floats * sizeof(float));
+    ::close(fd);
+    return ok;
+}
+}  // namespace
 
 namespace {
 
@@ -552,8 +595,31 @@ std::vector<float> Pi0ModelArch::predict(const Inputs& in) {
             return {};
         }
         const auto tv0 = clk::now();
+
+        // Prototype: the last view on the NPU, in parallel (see npu_vision_roundtrip).
+        static const char * npu_sock = std::getenv("VLA_PI0_NPU_VISION");
+        int                 n_gpu_views = in.n_images;
+        std::future<bool>   npu_job;
+        std::vector<float>  npu_chw;
+        if (npu_sock && *npu_sock && in.n_images >= 2) {
+            if (!preprocess_image_chw("pi0", in.images[in.n_images - 1], vit_image_size, npu_chw)) { return {}; }
+            float * dst = img_emb_host.data() + (size_t) (in.n_images - 1) * K * H;
+            npu_job = std::async(std::launch::async, [&npu_chw, dst, K, H] {
+                return npu_vision_roundtrip(npu_sock, npu_chw, dst, (size_t) (K * H));
+            });
+            n_gpu_views = in.n_images - 1;
+        }
+
         std::vector<float> chw;
         for (int v=0; v<in.n_images; ++v) {
+            if (v >= n_gpu_views) {
+                if (npu_job.get()) continue;  // the NPU delivered this view
+                static bool warned = false;
+                if (!warned) {
+                    warned = true;
+                    std::fprintf(stderr, "vla(pi0): NPU vision worker at %s failed; encoding on the GPU\n", npu_sock);
+                }
+            }
             if (!preprocess_image_chw("pi0", in.images[v], vit_image_size, chw)) { return {}; }
             ggml_backend_tensor_set(t_px, chw.data(), 0, ggml_nbytes(t_px));
             graph_unique_names(vg);

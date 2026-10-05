@@ -20,6 +20,8 @@
 #   bit:  fused kernels + fused attention (default)  vs  VLA_BITVLA_UNFUSED=1
 #   pi0:  bf16 + --flash-attn 1                      vs  bf16
 #   evo1: bf16 + --flash-attn 1                      vs  bf16
+#   pi0 npu arm (prototype): the opt arm with its second camera view encoded
+#         on the NPU by scripts/npu_vision_worker.py (VLA_PI0_NPU_VISION)
 #
 #   bash eval/sim/libero/setup_libero.sh            # once
 #   SERVERS=ON ci/local/build.sh sycl
@@ -29,7 +31,8 @@
 # whether the optimised arm is indistinguishable from its control, not whether
 # its actions match.
 #
-# Knobs: BUILD_DIR (build-sycl), MODELS (bit pi0 evo1), N_EPISODES_ALL (per
+# Knobs: ARMS (subset of opt ctl npu; default opt ctl), NPU_SOCK
+# (/tmp/pi0_npu.sock), BUILD_DIR (build-sycl), MODELS (bit pi0 evo1), N_EPISODES_ALL (per
 # task; default 10, and 5 for bit to match the B70 sweep), EPISODES_PER_PROC,
 # MODELS_ROOT, OUTPUT_ROOT,
 # MUJOCO_GL, SMOKE.
@@ -54,17 +57,24 @@ render_smoke
 arms_for() {
   case "$1" in
     bit)  echo "opt||" ; echo "ctl|VLA_BITVLA_UNFUSED=1|" ;;
-    pi0)  echo "opt||--act-dtype bf16 --flash-attn 1" ; echo "ctl||--act-dtype bf16" ;;
+    pi0)  echo "opt||--act-dtype bf16 --flash-attn 1" ; echo "ctl||--act-dtype bf16"
+          echo "npu|VLA_PI0_NPU_VISION=$NPU_SOCK|--act-dtype bf16 --flash-attn 1" ;;
     evo1) echo "opt||--act-dtype bf16 --flash-attn 1" ; echo "ctl||--act-dtype bf16" ;;
   esac
 }
 
+NPU_SOCK="${NPU_SOCK:-/tmp/pi0_npu.sock}"
+WANT_ARMS="${ARMS:-opt ctl}"
 ARMS=()
 for model in $MODELS; do
   default_n=10
   [ "$model" = bit ] && default_n=5
   N_EPISODES="${N_EPISODES_ALL:-$default_n}"
   while IFS='|' read -r arm envs args; do
+    case " $WANT_ARMS " in *" $arm "*) ;; *) continue ;; esac
+    if [ "$arm" = npu ] && [ ! -S "$NPU_SOCK" ]; then
+      fail "no NPU vision worker at $NPU_SOCK -- python scripts/npu_vision_worker.py --ir <pi0 vision IR>"
+    fi
     out="$OUTPUT_ROOT/$model-$arm"
     echo
     echo "########## $model / $arm  (env: ${envs:-none}  args: ${args:-none}) ##########"
