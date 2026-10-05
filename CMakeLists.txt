@@ -291,7 +291,7 @@ if(GGML_SYCL AND NOT GGML_CUDA)
     # vla_cuda_ops above, and implements the same idea with a quarter of the
     # code - ggml-sycl already has BF16 add/mul/unary, so only norm, rms_norm,
     # scale and the BF16-dst matmul are left. See src/sycl/vla_sycl_bf16.cpp.
-    add_library(vla_sycl_ops STATIC src/sycl/vla_sycl_bf16.cpp)
+    add_library(vla_sycl_ops STATIC src/sycl/vla_sycl_bf16.cpp src/sycl/vla_sycl_attn.cpp)
     target_include_directories(vla_sycl_ops PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${llama_SOURCE_DIR}/ggml/include

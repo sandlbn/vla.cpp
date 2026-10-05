@@ -38,6 +38,7 @@
 #endif
 #ifdef GGML_USE_SYCL
 #include "ggml-sycl.h"
+#include "sycl/vla_sycl_ops.h"
 #endif
 #ifdef GGML_USE_METAL
 #include "ggml-metal.h"
@@ -216,6 +217,10 @@ inline Backend backend_init(const char * tag, int n_threads) {
                          tag, dev, n_dev);
         } else if ((b.handle = ggml_backend_sycl_init(dev)) != nullptr) {
             b.is_sycl = true;
+            // The in-tree hook declines every op it does not own, so it is safe
+            // on F32 graphs - and FLASH_ATTN_EXT, which it does own, is faster
+            // through oneDNN's SDPA for every activation dtype.
+            vla::sycl_register_bf16_ops();
             char desc[256] = { 0 };
             ggml_backend_sycl_get_device_description(dev, desc, sizeof(desc));
             std::printf("%s: backend = SYCL (device %d: %s)\n", tag, dev, desc);

@@ -347,14 +347,22 @@ bool norm(ggml_tensor * dst, sycl::queue & q) {
 // hook entry point
 // ---------------------------------------------------------------------------
 
+namespace vla {
+bool sycl_flash_attn_ext(ggml_tensor * dst, sycl::queue & q);  // vla_sycl_attn.cpp
+}
+
 extern "C" bool vla_sycl_bf16_forward(ggml_tensor * dst, void * stream_v) {
     if (!dst || !stream_v || disabled()) return false;
+
+    sycl::queue & q = *static_cast<sycl::queue *>(stream_v);
+
+    // Flash attention is claimed for F32 results too: it is not a BF16 gap but
+    // a faster kernel for every activation dtype (vla_sycl_attn.cpp).
+    if (dst->op == GGML_OP_FLASH_ATTN_EXT) return vla::sycl_flash_attn_ext(dst, q);
 
     // Only BF16 results can be ours, and checking once here keeps the F32 graph
     // off every branch below.
     if (dst->type != GGML_TYPE_BF16) return false;
-
-    sycl::queue & q = *static_cast<sycl::queue *>(stream_v);
 
     switch (dst->op) {
         case GGML_OP_MUL_MAT:  return mul_mat(dst, q);
