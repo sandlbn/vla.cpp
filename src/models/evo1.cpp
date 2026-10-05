@@ -144,13 +144,25 @@ ggml_tensor * build_qwen2_layer(ggml_context * C, const Evo1ModelArch & m, const
     vp = as_type(C, vp, GGML_TYPE_F32);
     ggml_tensor * q_rope = ggml_rope_ext(C, ggml_reshape_3d(C, qp, hd, n_q,  seq), positions, nullptr, (int) hd, GGML_ROPE_TYPE_NEOX, 0, m.lm_rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
     ggml_tensor * k_rope = ggml_rope_ext(C, ggml_reshape_3d(C, kp, hd, n_kv, seq), positions, nullptr, (int) hd, GGML_ROPE_TYPE_NEOX, 0, m.lm_rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
-    ggml_tensor * Q = ggml_cont(C, ggml_permute(C, q_rope, 0, 2, 1, 3));
-    ggml_tensor * K = ggml_cont(C, ggml_permute(C, k_rope, 0, 2, 1, 3));
-    ggml_tensor * V = ggml_cont(C, ggml_permute(C, ggml_reshape_3d(C, vp, hd, n_kv, seq), 1, 2, 0, 3));
-    ggml_tensor * kq = ggml_mul_mat(C, K, Q); ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
-    ggml_tensor * aw = ggml_soft_max_ext(C, kq, mask, scale, 0.0f);
-    ggml_tensor * kqv = ggml_mul_mat(C, V, aw);
-    ggml_tensor * att = ggml_reshape_2d(C, ggml_cont(C, ggml_permute(C, kqv, 0, 2, 1, 3)), hq, seq);
+    ggml_tensor * att;
+    if (vla::flash_attn_enabled() && vla::fa_takes_views()) {
+        // Fused attention straight off the RoPE'd views (see fa_takes_views).
+        // The mask holds only 0 and -inf, exact in F16, which is what FA takes.
+        ggml_tensor * fa = ggml_flash_attn_ext(
+            C, ggml_permute(C, q_rope, 0, 2, 1, 3), ggml_permute(C, k_rope, 0, 2, 1, 3),
+            ggml_permute(C, ggml_reshape_3d(C, vp, hd, n_kv, seq), 0, 2, 1, 3),
+            mask ? ggml_cast(C, mask, GGML_TYPE_F16) : nullptr, scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
+        att = ggml_reshape_2d(C, fa, hq, seq);
+    } else {
+        ggml_tensor * Q = ggml_cont(C, ggml_permute(C, q_rope, 0, 2, 1, 3));
+        ggml_tensor * K = ggml_cont(C, ggml_permute(C, k_rope, 0, 2, 1, 3));
+        ggml_tensor * V = ggml_cont(C, ggml_permute(C, ggml_reshape_3d(C, vp, hd, n_kv, seq), 1, 2, 0, 3));
+        ggml_tensor * kq = ggml_mul_mat(C, K, Q); ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+        ggml_tensor * aw = ggml_soft_max_ext(C, kq, mask, scale, 0.0f);
+        ggml_tensor * kqv = ggml_mul_mat(C, V, aw);
+        att = ggml_reshape_2d(C, ggml_cont(C, ggml_permute(C, kqv, 0, 2, 1, 3)), hq, seq);
+    }
     ggml_tensor * attn_out = mm_act(C, w.Wo, as_type(C, att, at), at);
     if (qmask)
         attn_out = ggml_mul(C, attn_out, qmask);
@@ -731,6 +743,7 @@ std::vector<float> Evo1ModelArch::predict(const Inputs& in) {
 
     struct DC { ggml_tensor *Wq, *bq, *K, *V; };
     std::vector<DC> dc(dit_layers);
+    const bool dit_fa = vla::flash_attn_enabled() && vla::fa_takes_views();
     for (int64_t i=0; i<dit_layers; ++i) {
         const auto & w = dit[i];
         dc[i].Wq = inproj_split_w(C, w.Win, E, 0);
@@ -742,8 +755,15 @@ std::vector<float> Evo1ModelArch::predict(const Inputs& in) {
         // cross-attention K/V feed the F32 attention core
         ggml_tensor * kp = as_type(C, ggml_add(C, mm_act(C, Wk, context_tokens, at), bk), GGML_TYPE_F32);
         ggml_tensor * vp = as_type(C, ggml_add(C, mm_act(C, Wv, context_tokens, at), bv), GGML_TYPE_F32);
-        dc[i].K = ggml_cont(C, ggml_permute(C, ggml_reshape_3d(C, kp, hd_dit, dit_heads, Nctx), 0, 2, 1, 3));
-        dc[i].V = ggml_cont(C, ggml_permute(C, ggml_reshape_3d(C, vp, hd_dit, dit_heads, Nctx), 1, 2, 0, 3));
+        if (dit_fa) {
+            // FA layout: K and V both [hd, Nctx, heads]; one contiguous copy each,
+            // made once and re-read by all num_steps denoise passes.
+            dc[i].K = ggml_cont(C, ggml_permute(C, ggml_reshape_3d(C, kp, hd_dit, dit_heads, Nctx), 0, 2, 1, 3));
+            dc[i].V = ggml_cont(C, ggml_permute(C, ggml_reshape_3d(C, vp, hd_dit, dit_heads, Nctx), 0, 2, 1, 3));
+        } else {
+            dc[i].K = ggml_cont(C, ggml_permute(C, ggml_reshape_3d(C, kp, hd_dit, dit_heads, Nctx), 0, 2, 1, 3));
+            dc[i].V = ggml_cont(C, ggml_permute(C, ggml_reshape_3d(C, vp, hd_dit, dit_heads, Nctx), 1, 2, 0, 3));
+        }
     }
 
     auto denoise = [&](ggml_tensor * x_seq_masked, int64_t time_index) -> ggml_tensor * {
@@ -755,14 +775,26 @@ std::vector<float> Evo1ModelArch::predict(const Inputs& in) {
         for (int64_t i=0; i<dit_layers; ++i) {
             const auto & w = dit[i]; const auto & c = dc[i];
             ggml_tensor * x_q = ggml_add(C, ggml_mul(C, ggml_norm(C, x, proj_ln_eps), w.n1w), w.n1b);
-            ggml_tensor * qp = as_type(C, ggml_add(C, mm_act(C, c.Wq, x_q, at), c.bq), GGML_TYPE_F32);
-            ggml_tensor * Q = ggml_cont(C, ggml_permute(C, ggml_reshape_3d(C, qp, hd_dit, dit_heads, horizon), 0, 2, 1, 3));
-            ggml_tensor * kq = ggml_mul_mat(C, c.K, Q); ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
-            // The Evo-1 reference cross-attends over the full padded context
-            // (no key mask), so the action queries see every LM position.
-            ggml_tensor * aw = ggml_soft_max_ext(C, kq, nullptr, scale_dit, 0.0f);
-            ggml_tensor * kqv = ggml_mul_mat(C, c.V, aw);
-            ggml_tensor * att_pre = ggml_reshape_2d(C, ggml_cont(C, ggml_permute(C, kqv, 0, 2, 1, 3)), E, horizon);
+            ggml_tensor * att_pre;
+            if (dit_fa) {
+                // The Evo-1 reference cross-attends over the full padded context
+                // (no key mask), so the action queries see every LM position.
+                ggml_tensor * qv = ggml_add(C, mm_act(C, c.Wq, x_q, at), c.bq);
+                ggml_tensor * fa = ggml_flash_attn_ext(
+                    C, ggml_permute(C, ggml_reshape_3d(C, qv, hd_dit, dit_heads, horizon), 0, 2, 1, 3),
+                    c.K, c.V, nullptr, scale_dit, 0.0f, 0.0f);
+                ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
+                att_pre = ggml_reshape_2d(C, fa, E, horizon);
+            } else {
+                ggml_tensor * qp = as_type(C, ggml_add(C, mm_act(C, c.Wq, x_q, at), c.bq), GGML_TYPE_F32);
+                ggml_tensor * Q = ggml_cont(C, ggml_permute(C, ggml_reshape_3d(C, qp, hd_dit, dit_heads, horizon), 0, 2, 1, 3));
+                ggml_tensor * kq = ggml_mul_mat(C, c.K, Q); ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+                // The Evo-1 reference cross-attends over the full padded context
+                // (no key mask), so the action queries see every LM position.
+                ggml_tensor * aw = ggml_soft_max_ext(C, kq, nullptr, scale_dit, 0.0f);
+                ggml_tensor * kqv = ggml_mul_mat(C, c.V, aw);
+                att_pre = ggml_reshape_2d(C, ggml_cont(C, ggml_permute(C, kqv, 0, 2, 1, 3)), E, horizon);
+            }
             ggml_tensor * attn_out = ggml_add(C, mm_act(C, w.Wo, as_type(C, att_pre, at), at), w.bo);
             ggml_tensor * x1 = ggml_add(C, x, attn_out);
             ggml_tensor * x2 = ggml_add(C, ggml_mul(C, ggml_norm(C, x1, proj_ln_eps), w.n2w), w.n2b);
