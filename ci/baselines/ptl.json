@@ -1,0 +1,13 @@
+{
+  "platform": "ptl",
+  "source": "Panther Lake, Core Ultra 7 356H (Xe3 iGPU, 4 Xe cores, LPDDR5x), SYCL backend, branch ptl-xe3. LIBERO-object sweep ci/local/libero_ptl.sh, optimised arms: bitvla (fused kernels + fused attention, 10x5 episodes), pi0 and evo1 (bf16 activations + flash attention, the SYCL default, 10x10 episodes). See docs/backend/ptl.md.",
+  "note": "Server-side latency = mean `total` ms per vla-server call (two LIBERO camera views, so above vla-bench's single-view numbers). mem_metric is null: on this unified-memory iGPU the device allocations land in system memory alongside the LIBERO client (torch, MuJoCo) starting in parallel, and sys_used_delta_mib ranged 1.8-20.6 GB for the same pi0 server across runs, so it cannot gate. sr_reported is the sweep's success rate. Gate = actual <= tolerance * baseline.",
+  "tolerance": 1.10,
+  "latency_metric": "server_total_ms",
+  "mem_metric": null,
+  "models": {
+    "bitvla": {"server_total_ms": 169.32, "sr_reported": 1.000},
+    "pi0":    {"server_total_ms": 555.62, "sr_reported": 0.810},
+    "evo1":   {"server_total_ms": 844.30, "sr_reported": 0.990}
+  }
+}
