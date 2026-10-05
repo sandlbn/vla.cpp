@@ -28,13 +28,13 @@
 #include "gguf_reader.h"
 #include "scratch_ctx.h"
 
+#include "env_flag.h"
 #ifdef VLA_BITVLA_GPU_KERNELS
 #include "kernels/bitvla/bitvla_lm_cuda.h"
 #include "kernels/bitvla/bitvla_vit_cuda.h"
 #include "kernels/bitvla/bitvla_fp32head_cuda.h"
 #include "kernels/bitvla/device.h"
 #include "kernels/bitvla/ladder_pack.h"
-#include "env_flag.h"
 #ifdef __GLIBC__
 #  include <malloc.h>
 #endif
@@ -106,6 +106,14 @@ struct BitvlaModelArch : public ModelArchBase {
     /// Build the FFN gate in the f16-safe form (see build_lm_layer). Set on the
     /// OpenVINO backend, which runs f16 on the GPU plugin and the NPU.
     bool                  f16_safe_gate = false;
+    /// Attention as one ggml_flash_attn_ext, which ggml-openvino lowers to
+    /// OpenVINO's fused ScaledDotProductAttention at f16 (Q/K/V in f16, softmax
+    /// accumulated in f32 by the plugin) instead of a MatMul / Softmax / MatMul
+    /// chain at whatever precision the device picks. Opt-in on the OpenVINO
+    /// backend with VLA_BITVLA_OV_FA=1: it moves f32 actions by ~0.05 and does
+    /// not on its own fix the f16 path on Panther Lake (docs/backend/ptl.md),
+    /// so it waits on a LIBERO result before becoming the default.
+    bool                  fused_attn = false;
 
     std::string           gguf_path;
     gguf_reader           emb_reader{"bitvla"};   // stays open for per-step token-embedding row fetches
@@ -206,7 +214,8 @@ ggml_tensor * rmsnorm(ggml_context * C, ggml_tensor * x, ggml_tensor * w, float 
 }
 
 ggml_tensor * build_vit_layer(ggml_context * C, const VitLayerW & w, ggml_tensor * x,
-                               int64_t seq, int64_t heads, int64_t head_dim, int64_t hidden, float ln_eps) {
+                               int64_t seq, int64_t heads, int64_t head_dim, int64_t hidden, float ln_eps,
+                               bool fused_attn) {
     const float scale = 1.0f/std::sqrt((float) head_dim);
     ggml_tensor * x1 = layernorm(C, x, w.ln1w, w.ln1b, ln_eps);
     ggml_tensor * q  = bit_linear(C, w.Wq, w.bq, x1);
@@ -214,10 +223,18 @@ ggml_tensor * build_vit_layer(ggml_context * C, const VitLayerW & w, ggml_tensor
     ggml_tensor * v  = bit_linear(C, w.Wv, w.bv, x1);
     ggml_tensor * Q  = ggml_cont(C, ggml_permute(C, ggml_reshape_3d(C, q, head_dim, heads, seq), 0, 2, 1, 3));
     ggml_tensor * K  = ggml_cont(C, ggml_permute(C, ggml_reshape_3d(C, k, head_dim, heads, seq), 0, 2, 1, 3));
-    ggml_tensor * V  = ggml_cont(C, ggml_permute(C, ggml_reshape_3d(C, v, head_dim, heads, seq), 1, 2, 0, 3));
-    ggml_tensor * kq = ggml_mul_mat(C, K, Q); ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
-    ggml_tensor * att= ggml_soft_max_ext(C, kq, nullptr, scale, 0.0f);
-    ggml_tensor * y  = ggml_reshape_2d(C, ggml_cont(C, ggml_permute(C, ggml_mul_mat(C, V, att), 0, 2, 1, 3)), hidden, seq);
+    ggml_tensor * y;
+    if (fused_attn) {
+        ggml_tensor * V  = ggml_cont(C, ggml_permute(C, ggml_reshape_3d(C, v, head_dim, heads, seq), 0, 2, 1, 3));
+        ggml_tensor * fa = ggml_flash_attn_ext(C, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
+        y = ggml_reshape_2d(C, fa, hidden, seq);
+    } else {
+        ggml_tensor * V  = ggml_cont(C, ggml_permute(C, ggml_reshape_3d(C, v, head_dim, heads, seq), 1, 2, 0, 3));
+        ggml_tensor * kq = ggml_mul_mat(C, K, Q); ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+        ggml_tensor * att= ggml_soft_max_ext(C, kq, nullptr, scale, 0.0f);
+        y = ggml_reshape_2d(C, ggml_cont(C, ggml_permute(C, ggml_mul_mat(C, V, att), 0, 2, 1, 3)), hidden, seq);
+    }
     ggml_tensor * o  = bit_linear(C, w.Wo, w.bo, y);
     ggml_tensor * h1 = ggml_add(C, x, o);
     ggml_tensor * x2 = layernorm(C, h1, w.ln2w, w.ln2b, ln_eps);
@@ -242,14 +259,22 @@ ggml_tensor * build_lm_layer(ggml_context * C, const BitvlaModelArch & m, const 
     ggml_tensor * kR = ggml_rope_ext(C, k3, positions, nullptr, (int) hd, GGML_ROPE_TYPE_NEOX, 0, m.lm_rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
     ggml_tensor * Q  = ggml_cont(C, ggml_permute(C, qR, 0, 2, 1, 3));
     ggml_tensor * K  = ggml_cont(C, ggml_permute(C, kR, 0, 2, 1, 3));
-    ggml_tensor * V  = ggml_cont(C, ggml_permute(C, v3, 1, 2, 0, 3));
-    ggml_tensor * kq = ggml_mul_mat(C, K, Q); ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
     // Unmasked on purpose, same as openvla_oft: BitVLA is fine-tuned with
     // OpenVLA-OFT's recipe, which swaps the causal mask for a bidirectional one
     // so the action chunk decodes in a single pass.
-    ggml_tensor * att= ggml_soft_max_ext(C, kq,  nullptr, scale, 0.0f);
-    ggml_tensor * kqv= ggml_mul_mat(C, V, att);
-    ggml_tensor * mer= ggml_reshape_2d(C, ggml_cont(C, ggml_permute(C, kqv, 0, 2, 1, 3)), hq, seq);
+    ggml_tensor * mer;
+    if (m.fused_attn) {
+        ggml_tensor * V  = ggml_cont(C, ggml_permute(C, v3, 0, 2, 1, 3));
+        ggml_tensor * fa = ggml_flash_attn_ext(C, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
+        mer = ggml_reshape_2d(C, fa, hq, seq);
+    } else {
+        ggml_tensor * V  = ggml_cont(C, ggml_permute(C, v3, 1, 2, 0, 3));
+        ggml_tensor * kq = ggml_mul_mat(C, K, Q); ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+        ggml_tensor * att= ggml_soft_max_ext(C, kq,  nullptr, scale, 0.0f);
+        ggml_tensor * kqv= ggml_mul_mat(C, V, att);
+        mer = ggml_reshape_2d(C, ggml_cont(C, ggml_permute(C, kqv, 0, 2, 1, 3)), hq, seq);
+    }
     ggml_tensor * sub= rmsnorm(C, mer, w.attn_sub_norm, m.lm_rms_eps);
     ggml_tensor * o  = bit_linear(C, w.Wo, nullptr, sub);
     ggml_tensor * h1 = ggml_add(C, h, o);
@@ -714,6 +739,7 @@ std::unique_ptr<ModelArchBase> bitvla_create(const std::string& mmproj_path,
         if (!m->backend)
             return nullptr;
         m->f16_safe_gate = b.is_openvino;
+        m->fused_attn    = b.is_openvino && vla::env_flag("VLA_BITVLA_OV_FA");
     }
 
     ggml_init_params wp = {  (size_t) 32*1024*1024,  nullptr,  true };
@@ -1255,7 +1281,7 @@ std::vector<float> BitvlaModelArch::predict(const Inputs& in) {
             ggml_tensor * pe = ggml_add(ctx, ggml_mul_mat(ctx, vit_patch_w, x_in), vit_patch_b);
             ggml_tensor * h  = ggml_add(ctx, pe, vit_pos);
             for (int64_t L=0; L<vit_layers; ++L) {
-                h = build_vit_layer(ctx, vit[L], h, N, vit_heads, vit_head_dim, hidden_v, vit_ln_eps);
+                h = build_vit_layer(ctx, vit[L], h, N, vit_heads, vit_head_dim, hidden_v, vit_ln_eps, fused_attn);
             }
 
             ggml_tensor * mm1 = ggml_add(ctx, ggml_mul_mat(ctx, mm_l1_w, h),   mm_l1_b);
