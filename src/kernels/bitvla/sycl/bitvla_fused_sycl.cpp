@@ -66,6 +66,7 @@ template <int NI> struct k_add_layernorm_quant {};
 template <int NI> struct k_bias_gelu_quant_pad {};
 struct k_bias_residual {};
 struct k_rope_qk_rows {};
+struct k_rope_qk_rows_v {};
 
 /// The width the unfused row kernels compiled to (unitrace: SIMD 32). Pinned
 /// so the reduction trees, and with them the bits, match.
@@ -728,10 +729,52 @@ extern "C" void bitvla_rope_neox_qk_rows_bf16(vla_bf16* q, vla_bf16* k, const fl
     sycl::queue & q_      = vla::bitvla_sycl_queue(stream);
     bf16 *        qs      = as_bf(q);
     bf16 *        ks      = as_bf(k);
+    constexpr int WG      = 256;
+
+    // Vector path: each work-item rotates 8 adjacent pairs, so the two halves
+    // and both tables come in as 16- and 32-byte loads instead of one element
+    // per work-item (31 GB/s on Xe3). Same per-element arithmetic, same bits.
+    const bool vec = half % VEC == 0 && q_ld % VEC == 0 && k_ld % VEC == 0 &&
+                     ((uintptr_t) q % 16) == 0 && ((uintptr_t) k % 16) == 0 &&
+                     ((uintptr_t) cos_tab % 32) == 0 && ((uintptr_t) sin_tab % 32) == 0;
+    if (vec) {
+        const int    groups = half / VEC;
+        const size_t total  = (size_t) S * n_heads * groups;
+        q_.parallel_for<k_rope_qk_rows_v>(
+            sycl::nd_range<1>(vla::bitvla::round_up(total, WG), WG), [=](sycl::nd_item<1> it) {
+                const size_t i = it.get_global_id(0);
+                if (i >= total) return;
+                const int g  = (int) (i % groups);
+                const int hh = (int) ((i / groups) % n_heads);
+                const int s  = (int) (i / ((size_t) groups * n_heads));
+                const int kk = g * VEC;
+
+                bf16 * row = hh < n_q ? qs + (size_t) s * q_ld + (size_t) hh * hd
+                                      : ks + (size_t) s * k_ld + (size_t) (hh - n_q) * hd;
+                const vbf a8 = load8(row + kk), b8 = load8(row + kk + half);
+                const sycl::vec<float, VEC> c8 =
+                    *reinterpret_cast<const sycl::vec<float, VEC> *>(cos_tab + (size_t) s * half + kk);
+                const sycl::vec<float, VEC> s8 =
+                    *reinterpret_cast<const sycl::vec<float, VEC> *>(sin_tab + (size_t) s * half + kk);
+                vbf ra, rb;
+#pragma unroll
+                for (int j = 0; j < VEC; ++j) {
+                    const float c  = c8[j];
+                    const float si = s8[j];
+                    const float a  = bf_bits_to_f32(a8[j]);
+                    const float b  = bf_bits_to_f32(b8[j]);
+                    ra[j]          = f32_to_bf_bits(a * c - b * si);
+                    rb[j]          = f32_to_bf_bits(b * c + a * si);
+                }
+                store8(row + kk, ra);
+                store8(row + kk + half, rb);
+            });
+        return;
+    }
+
     // One work-item per rotated pair: (s, head, k < half). Heads [0, n_q) are
     // Q's, the rest K's.
     const size_t total = (size_t) S * n_heads * half;
-    constexpr int WG   = 256;
     q_.parallel_for<k_rope_qk_rows>(
         sycl::nd_range<1>(vla::bitvla::round_up(total, WG), WG), [=](sycl::nd_item<1> it) {
             const size_t i = it.get_global_id(0);

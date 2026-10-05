@@ -78,6 +78,17 @@ if(NOT VLA_LLAMA_TAG STREQUAL _vla_llama_tag_default)
         "-DVLA_LLAMA_TAG=${_vla_llama_tag_default} or use a fresh one.")
 endif()
 
+# Ahead-of-time device code for the SYCL build. Empty (the default) ships
+# SPIR-V only and lets the driver JIT every kernel at first use; a device list
+# in ocloc's spelling compiles native binaries for those parts at build time and
+# keeps SPIR-V alongside for any other GPU. e.g. Panther Lake: "ptl-u,ptl-h";
+# Battlemage: "bmg". Forwarded to ggml-sycl's GGML_SYCL_DEVICE_ARCH unless that
+# is set explicitly. See docs/backend/ptl.md.
+set(VLA_SYCL_DEVICE_ARCH "" CACHE STRING "ocloc device list for SYCL AOT (empty = JIT)")
+if(GGML_SYCL AND VLA_SYCL_DEVICE_ARCH AND NOT GGML_SYCL_DEVICE_ARCH)
+    set(GGML_SYCL_DEVICE_ARCH "${VLA_SYCL_DEVICE_ARCH}" CACHE STRING "" FORCE)
+endif()
+
 include(FetchContent)
 FetchContent_Declare(llama
     GIT_REPOSITORY https://github.com/ggml-org/llama.cpp
@@ -230,6 +241,18 @@ if(GGML_SYCL AND NOT GGML_CUDA)
     # as icpx, so if the compiler was found this will be too.
     find_package(DNNL REQUIRED)
 
+    # VLA_SYCL_DEVICE_ARCH -> native code for the listed devices plus SPIR-V.
+    # The device link happens wherever the archive is linked, so the targets go
+    # on the PUBLIC link options too.
+    function(vla_sycl_aot tgt)
+        if(VLA_SYCL_DEVICE_ARCH)
+            set(_aot -fsycl-targets=spir64_gen,spir64
+                     "SHELL:-Xsycl-target-backend=spir64_gen \"-device ${VLA_SYCL_DEVICE_ARCH}\"")
+            target_compile_options(${tgt} PRIVATE ${_aot})
+            target_link_options(${tgt} PUBLIC ${_aot})
+        endif()
+    endfunction()
+
     add_library(bitvla_sycl_kernels STATIC
         src/kernels/bitvla/sycl/device_sycl.cpp
         src/kernels/bitvla/sycl/bitvla_ops_sycl.cpp
@@ -278,6 +301,7 @@ if(GGML_SYCL AND NOT GGML_CUDA)
     # not catch it because they link this archive into an executable and pass
     # -fsycl themselves.
     target_link_options(bitvla_sycl_kernels PUBLIC -fsycl)
+    vla_sycl_aot(bitvla_sycl_kernels)
     target_link_libraries(bitvla_sycl_kernels PUBLIC DNNL::dnnl)
     target_link_libraries(vla_core PRIVATE bitvla_sycl_kernels)
     # Same definition the CUDA branch sets: the engine only asks whether
@@ -305,6 +329,7 @@ if(GGML_SYCL AND NOT GGML_CUDA)
     # PUBLIC for the same reason bitvla_sycl_kernels needs it: the device images
     # live in this archive and whoever links it must run the SYCL device link.
     target_link_options(vla_sycl_ops PUBLIC -fsycl)
+    vla_sycl_aot(vla_sycl_ops)
     target_link_libraries(vla_sycl_ops PUBLIC DNNL::dnnl ggml ggml-sycl)
     target_link_libraries(vla_core PRIVATE vla_sycl_ops)
 endif()

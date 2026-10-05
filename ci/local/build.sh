@@ -22,8 +22,10 @@
 #   SERVERS=ON ci/local/build.sh sycl      # + vla-server, needed for LIBERO
 #   CLEAN=1 ci/local/build.sh ov           # wipe the build dir first
 #   TARGETS="vla-bench" ci/local/build.sh sycl
+#   SYCL_AOT=ptl-u,ptl-h ci/local/build.sh sycl   # native Xe3 code, no first-run JIT
 #
-# Knobs: BUILD_DIR, SERVERS (OFF), CLEAN (0), TARGETS (all), JOBS, plus the
+# Knobs: BUILD_DIR, SERVERS (OFF), CLEAN (0), TARGETS (all), JOBS, SYCL_AOT
+# (ocloc device list -> VLA_SYCL_DEVICE_ARCH; empty = JIT), plus the
 # toolchain paths documented in ci/local/common.sh.
 # =============================================================================
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
@@ -44,6 +46,8 @@ CMAKE_ARGS=(-DCMAKE_BUILD_TYPE=Release -DVLA_BUILD_TESTS=ON -DVLA_BUILD_SERVERS=
 if [ "$BACKEND" = sycl ]; then
   load_oneapi
   CMAKE_ARGS+=(-DGGML_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx)
+  [ -n "${SYCL_AOT:-}" ] && CMAKE_ARGS+=(-DVLA_SYCL_DEVICE_ARCH="$SYCL_AOT")
+  echo "SYCL_AOT:  ${SYCL_AOT:-none (JIT)}"
 else
   load_openvino
   # The ggml-openvino patches (scripts/patch_ggml_openvino.py) are applied by
