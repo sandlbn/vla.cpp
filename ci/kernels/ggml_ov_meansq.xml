@@ -1,0 +1,100 @@
+<!-- Copyright 2026 VinRobotics
+
+     Licensed under the Apache License, Version 2.0 (the "License");
+     you may not use this file except in compliance with the License.
+     You may obtain a copy of the License at
+
+         http://www.apache.org/licenses/LICENSE-2.0
+
+     Unless required by applicable law or agreed to in writing, software
+     distributed under the License is distributed on an "AS IS" BASIS,
+     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+     See the License for the specific language governing permissions and
+     limitations under the License.
+     ========================================================================
+     ggml_ov_meansq.xml: the GPU CustomLayer descriptor for mode 9.
+
+     NOTE FOR ANYONE EDITING THE PROSE HERE. XML forbids a double hyphen inside
+     a comment, so none of these notes may contain one. It is not a style
+     choice; it makes the file unparseable, and the plugin reports that as a
+     failure to bind rather than as a bad descriptor.
+
+     Reached by GGML_OPENVINO_CUSTOM_KERNELS=<path to this file>, which
+     ggml_openvino_get_device_config() turns into the GPU plugin's CONFIG_FILE
+     property. <Source filename=> is resolved RELATIVE TO THIS FILE, so the .cl
+     must sit beside it; do not move one without the other.
+
+     BINDING IS BY OP TYPE NAME. The plugin matches name= below against
+     op->get_type_info().name and calls CreateCustomOp before its own op
+     factory, which is why GgmlMeanSq (an op type OpenVINO has never heard of)
+     reaches the device at all. openvino/op/rms_norm.cpp declares the op under
+     exactly this name; the two strings are one contract, and changing either
+     alone silently drops the graph back to the plugin's own path.
+
+     ONE DESCRIPTOR COVERS EVERY RMS NODE. Job 372899 bound variant 1, which
+     establishes that INPUT0_DIMS, INPUT0_TYPE and OUTPUT0_TYPE all exist under
+     those spellings in this build. K therefore arrives per node as
+     INPUT0_DIMS[3] and the element types arrive as the plugin's own, so the
+     2560, 6912 and 1152 wide norms all share this one entry. Had only the
+     all-static variant bound, this file would have had to be generated per
+     distinct K at runtime.
+
+     WHY VARIANT 1. It follows the plugin's own element types through
+     INPUT0_TYPE / INPUT1_TYPE / OUTPUT0_TYPE rather than hardcoding them, which
+     is what lets this op carry whatever precision the surrounding graph settled
+     on instead of forcing a boundary.
+
+     WHY THE ENTRY POINT IS ggml_ov_rrms AND NOT ggml_ov_meansq. Two jobs
+     measured the answer. Binding the mean of squares needs an f32 output,
+     because job 372912 found that mean(x^2) OVERFLOWS f16 on this model: the
+     chunk spread went to exactly 0.00000, the signature of mean = inf reaching
+     1/sqrt(inf) = 0. And job 372911 found what an f32 output then costs, since
+     726 opaque f32 custom ops inside an f16 graph disrupt the plugin's
+     precision plan badly enough to add 8.77 SECONDS of full size reorders
+     against the 47 ms being chased.
+
+     The reciprocal RMS escapes both. It runs about 1e-3 to 1e-1 here, far from
+     f16's 65504 ceiling and equally far from its 6e-8 subnormal floor, so the
+     output can follow the input type and no boundary appears. It is also
+     exactly what the plugin's own rms_gpu_bfyx_opt stores, for the same reason.
+
+     eps is the SECOND INPUT, not a <Define>. As a define it would have to be
+     baked per eps value, which means generating this file at runtime; as an
+     input it is one more constant the frontend already has, and one descriptor
+     still covers every norm.
+-->
+<CustomLayer name="GgmlRmsRecip" type="SimpleGPU" version="1">
+  <Kernel entry="ggml_ov_rrms">
+    <Source filename="ggml_ov_meansq.cl"/>
+    <Define name="MS_VARIANT" type="int" default="1"/>
+    <!-- Entry 2 is ggml_ov_rrms. The .cl holds two __kernel bodies and cldnn
+         asserts a program contains exactly one, so whichever is not being bound
+         has to be preprocessed away. It defaults to 2 inside the file as well,
+         but a contract this easy to break is worth stating in both places. Job
+         372913 is what breaking it looks like: valid OpenCL C that compiles
+         standalone and fails at ProgramBuilder with an error naming neither the
+         file nor the surplus kernel. -->
+    <Define name="MS_ENTRY" type="int" default="2"/>
+    <!-- LWS is read twice: the kernel sizes its __local array and its
+         reqd_work_group_size from this define, and the dispatch below takes it
+         from <WorkSizes local=>. They must agree. A mismatch is not a build
+         error, it is a wrong answer. -->
+    <Define name="LWS" type="int" default="256"/>
+  </Kernel>
+  <Buffers>
+    <Tensor arg-index="0" type="input"  port-index="0" format="BFYX"/>
+    <!-- eps, one element. -->
+    <Tensor arg-index="1" type="input"  port-index="1" format="BFYX"/>
+    <Tensor arg-index="2" type="output" port-index="0" format="BFYX"/>
+  </Buffers>
+  <!-- CL2.0 is required: get_sub_group_id and get_num_sub_groups are OpenCL 2.0
+       builtins, and without the flag every variant fails at
+       CL_BUILD_PROGRAM_FAILURE (job 372897). A CustomLayer source gets none of
+       the JIT preamble cldnn prepends to its own kernels. -->
+  <CompilerOptions options="-cl-mad-enable -cl-std=CL2.0"/>
+  <!-- One work-group per row. global is the OUTPUT element count times LWS, and
+       the output is {..., rows, 1}, so B*F*Y*X is the row count however the
+       plugin assigned the axes. That is what makes this need no per shape
+       edit. -->
+  <WorkSizes global="B*F*Y*X*256,1,1" local="256,1,1"/>
+</CustomLayer>

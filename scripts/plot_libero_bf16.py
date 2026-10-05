@@ -132,6 +132,13 @@ def load_arm(spec: str, label: str) -> dict[int, dict]:
     return per_task
 
 
+def tick_label(model: str, dtype: str) -> str:
+    """Arm label under a bar. An arm named "weights / compute" (the OpenVINO
+    figure's arms) is too wide for one line once there are five bars in a 1.3-wide
+    panel, and the neighbours overprint it -- so it breaks at the slash."""
+    return f"{model}\n" + dtype.replace(" / ", "\n")
+
+
 def totals(per_task: dict[int, dict]) -> tuple[int, int, float]:
     succ = sum(t["successes"] for t in per_task.values())
     eps = sum(t["n_episodes"] for t in per_task.values())
@@ -191,8 +198,10 @@ def main() -> int:
             sr = [per_task[t]["successes"] / per_task[t]["n_episodes"]
                   if per_task[t]["n_episodes"] else 0.0 for t in ids]
             lo_hi = [wilson(per_task[t]["successes"], per_task[t]["n_episodes"]) for t in ids]
-            err = np.array([[s - lo for s, (lo, _) in zip(sr, lo_hi)],
-                            [hi - s for s, (_, hi) in zip(sr, lo_hi)]])
+            # Clamped: at p = 1 the Wilson upper bound is 1 only up to rounding,
+            # and matplotlib rejects the resulting -1e-17 bar length outright.
+            err = np.array([[max(0.0, s - lo) for s, (lo, _) in zip(sr, lo_hi)],
+                            [max(0.0, hi - s) for s, (_, hi) in zip(sr, lo_hi)]])
             x = np.arange(len(ids)) + (j - (len(dtypes) - 1) / 2) * width
             ax.bar(x, sr, width, label=dtype, color=colours.get(dtype),
                    yerr=err, capsize=2, ecolor="#444444", error_kw={"lw": 1.0})
@@ -220,9 +229,9 @@ def main() -> int:
                 continue
             succ, eps, _ = totals(per_task)
             lo, hi = wilson(succ, eps)
-            labels.append(f"{model}\n{dtype}")
+            labels.append(tick_label(model, dtype))
             vals.append(succ / eps if eps else 0.0)
-            errs.append((vals[-1] - lo, hi - vals[-1]))
+            errs.append((max(0.0, vals[-1] - lo), max(0.0, hi - vals[-1])))
             cols.append(colours.get(dtype))
     err = np.array(errs).T if errs else None
     ax.bar(range(len(vals)), vals, 0.6, color=cols, yerr=err, capsize=3,
@@ -243,7 +252,7 @@ def main() -> int:
             if per_task is None:
                 continue
             _, _, inf = totals(per_task)
-            labels.append(f"{model}\n{dtype}")
+            labels.append(tick_label(model, dtype))
             vals.append(inf)
             cols.append(colours.get(dtype))
     ax.bar(range(len(vals)), vals, 0.6, color=cols)
@@ -261,11 +270,21 @@ def main() -> int:
     # One figure-level legend rather than one per panel: an in-axes legend has
     # nowhere to sit here. Success rates cluster at the top of the panel and the
     # error bars reach the bottom, so every corner is occupied by data.
+    #
+    # Title and legend get a row each, in a band the panels are kept out of.
+    # Both used to be pinned to the top edge -- the legend left, the title
+    # centred -- and once the legend grew to four arms (b70/h100 x f32/bf16) it
+    # ran underneath the title. Sizes are in inches so the band does not scale
+    # with the figure height.
+    fig_h = fig.get_figheight()
+    title_h, legend_h, pad = 0.34, 0.34, 0.10
+    top = 1.0 - (title_h + legend_h + pad) / fig_h
+    fig.tight_layout(rect=(0, 0, 1, top))
+    fig.suptitle(args.title, y=1.0 - 0.04 / fig_h, va="top")
     handles = [plt.Rectangle((0, 0), 1, 1, color=colours.get(d)) for d in dtypes]
-    fig.legend(handles, dtypes, loc="upper left", ncol=len(dtypes), frameon=False)
-
-    fig.suptitle(args.title)
-    fig.tight_layout()
+    fig.legend(handles, dtypes, loc="upper center",
+               bbox_to_anchor=(0.5, 1.0 - title_h / fig_h),
+               ncol=len(dtypes), frameon=False)
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
