@@ -139,7 +139,10 @@ What is left: the ternary GEMMs are ~30 TOPS at M=330, ~80% of the measured
 
 BitVLA's actions cannot be judged by `compare_actions`: a one-bf16-step change in
 0.5% of the ViT output already moves them ~0.15 normalised, because the int8
-activation quantisers amplify any perturbation. Its gate is LIBERO success.
+activation quantisers amplify any perturbation. Its gate is LIBERO success, and
+it passes: LIBERO-object, 10 tasks x 5 episodes (`ci/local/libero_ptl.sh`),
+fused **50/50** against the unfused control's 50/50, at 37 ms vs 52 ms of
+server-side inference per step.
 
 ## Switches
 
