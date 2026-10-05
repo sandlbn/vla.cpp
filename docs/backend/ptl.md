@@ -87,6 +87,7 @@ weight unpack). The AOT build takes roughly twice as long.
 | BitVLA | OpenVINO GPU, q8_0, f16 | 228.6 ms | - | (SYCL is 2.7x faster) |
 | pi0 | SYCL, bf16 act | 453 ms | **346 ms** | -24% |
 | pi0 | SYCL, f32 act | 481 ms | **379 ms** | -21% |
+| pi0.5 | SYCL, f32 act | 569.5 ms | **458.4 ms** | -20% |
 | Evo-1 | SYCL, bf16 act | 1314 ms | **512 ms** | -61% |
 | Evo-1 | SYCL, f32 act | 1443 ms | **583 ms** | -60% |
 
@@ -125,9 +126,11 @@ What is left: the ternary GEMMs are ~30 TOPS at M=330, ~80% of the measured
 
 ### The ggml graph models (pi0, Evo-1)
 
-Flash attention is **on by default on SYCL** for pi0 and Evo-1 (both
-LIBERO-validated below); `--flash-attn 0` restores the unfused graph. Other
-backends keep it opt-in.
+Flash attention is **on by default on SYCL** for pi0, pi0.5 and Evo-1 (pi0 and
+Evo-1 LIBERO-validated below; pi0.5's actions move 0.0006 normalised against
+its unfused graph); `--flash-attn 0` restores the unfused graph. Other backends
+keep it opt-in. pi0.5 had no flash-attention path at all before; its SigLIP,
+VLM and expert blocks now take the same fused path on SYCL.
 
 - **`GGML_OP_FLASH_ATTN_EXT` on oneDNN's SDPA** (`src/sycl/vla_sycl_attn.cpp`),
   claimed in the existing ggml-sycl hook. ggml-sycl's own FA is slower than the

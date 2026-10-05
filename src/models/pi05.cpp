@@ -125,6 +125,22 @@ struct Pi05ModelArch : public ModelArchBase {
 
 namespace {
 
+// On a view-taking flash attention (vla::fa_takes_views(), i.e. SYCL with
+// --flash-attn), attention runs fused straight off the [hd, H, S] views; the
+// unfused graph below is otherwise unchanged. All three of pi05's attention
+// sites are unmasked. Returns [H*hd, S_q].
+ggml_tensor * fused_attention(ggml_context * C, ggml_tensor * q3, ggml_tensor * k3,
+                              ggml_tensor * v3, float scale, int64_t qf, int64_t seq) {
+    ggml_tensor * fa = ggml_flash_attn_ext(C, ggml_permute(C, q3, 0, 2, 1, 3),
+                                           ggml_permute(C, k3, 0, 2, 1, 3),
+                                           ggml_permute(C, v3, 0, 2, 1, 3), nullptr, scale,
+                                           0.0f, 0.0f);
+    ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
+    return ggml_reshape_2d(C, fa, qf, seq);
+}
+
+bool use_fused_attention() { return vla::flash_attn_enabled() && vla::fa_takes_views(); }
+
 // One pre-norm SigLIP encoder block, identical to gr00tn1d5's in-tree tower
 // (the PaliGemma vision tower is the same SigLIP-So400m/14). Bidirectional
 // attention (nullptr mask), F32 score accumulation, tanh GELU FFN.
@@ -135,12 +151,19 @@ ggml_tensor * build_siglip_layer(ggml_context * C, const EncBlockW & w, ggml_ten
     ggml_tensor * q = ggml_add(C, ggml_mul_mat(C, w.Wq, n1), w.bq);
     ggml_tensor * k = ggml_add(C, ggml_mul_mat(C, w.Wk, n1), w.bk);
     ggml_tensor * v = ggml_add(C, ggml_mul_mat(C, w.Wv, n1), w.bv);
-    ggml_tensor * Q = ggml_cont(C, ggml_permute(C, ggml_reshape_3d(C, q, head_dim, heads, seq), 0, 2, 1, 3));
-    ggml_tensor * K = ggml_cont(C, ggml_permute(C, ggml_reshape_3d(C, k, head_dim, heads, seq), 0, 2, 1, 3));
-    ggml_tensor * V = ggml_cont(C, ggml_permute(C, ggml_reshape_3d(C, v, head_dim, heads, seq), 1, 2, 0, 3));
-    ggml_tensor * kq = ggml_mul_mat(C, K, Q); ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
-    ggml_tensor * aw = ggml_soft_max_ext(C, kq, nullptr, scale, 0.0f);
-    ggml_tensor * att = ggml_reshape_2d(C, ggml_cont(C, ggml_permute(C, ggml_mul_mat(C, V, aw), 0, 2, 1, 3)), hidden, seq);
+    ggml_tensor * att;
+    if (use_fused_attention()) {
+        att = fused_attention(C, ggml_reshape_3d(C, q, head_dim, heads, seq),
+                              ggml_reshape_3d(C, k, head_dim, heads, seq),
+                              ggml_reshape_3d(C, v, head_dim, heads, seq), scale, hidden, seq);
+    } else {
+        ggml_tensor * Q = ggml_cont(C, ggml_permute(C, ggml_reshape_3d(C, q, head_dim, heads, seq), 0, 2, 1, 3));
+        ggml_tensor * K = ggml_cont(C, ggml_permute(C, ggml_reshape_3d(C, k, head_dim, heads, seq), 0, 2, 1, 3));
+        ggml_tensor * V = ggml_cont(C, ggml_permute(C, ggml_reshape_3d(C, v, head_dim, heads, seq), 1, 2, 0, 3));
+        ggml_tensor * kq = ggml_mul_mat(C, K, Q); ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+        ggml_tensor * aw = ggml_soft_max_ext(C, kq, nullptr, scale, 0.0f);
+        att = ggml_reshape_2d(C, ggml_cont(C, ggml_permute(C, ggml_mul_mat(C, V, aw), 0, 2, 1, 3)), hidden, seq);
+    }
     ggml_tensor * h1 = ggml_add(C, x, ggml_add(C, ggml_mul_mat(C, w.Wo, att), w.bo));
     ggml_tensor * n2 = ggml_add(C, ggml_mul(C, ggml_norm(C, h1, ln_eps), w.ln2w), w.ln2b);
     ggml_tensor * ff = ggml_add(C, ggml_mul_mat(C, w.Wfc2, ggml_gelu(C, ggml_add(C, ggml_mul_mat(C, w.Wfc1, n2), w.bfc1))), w.bfc2);
@@ -182,18 +205,23 @@ ggml_tensor * build_vlm_layer(
     if (v_out)
         *v_out = v_h;
 
-    ggml_tensor * Q = ggml_cont(ctx, ggml_permute(ctx, q_rope, 0, 2, 1, 3));
-    ggml_tensor * K = ggml_cont(ctx, ggml_permute(ctx, k_rope, 0, 2, 1, 3));
-    ggml_tensor * V = ggml_cont(ctx, ggml_permute(ctx, v_h,    1, 2, 0, 3));
-
-    ggml_tensor * kq = ggml_mul_mat(ctx, K, Q);
-    ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
     const float scale = 1.f/std::sqrt((float) hd);
-    ggml_tensor * attn = ggml_soft_max_ext(ctx, kq,  nullptr, scale, 0.f);
-    ggml_tensor * kqv  = ggml_mul_mat(ctx, V, attn);
+    ggml_tensor * att_pre;
+    if (use_fused_attention()) {
+        att_pre = fused_attention(ctx, q_rope, k_rope, v_h, scale, qf, seq);
+    } else {
+        ggml_tensor * Q = ggml_cont(ctx, ggml_permute(ctx, q_rope, 0, 2, 1, 3));
+        ggml_tensor * K = ggml_cont(ctx, ggml_permute(ctx, k_rope, 0, 2, 1, 3));
+        ggml_tensor * V = ggml_cont(ctx, ggml_permute(ctx, v_h,    1, 2, 0, 3));
 
-    ggml_tensor * att_pre = ggml_reshape_2d(ctx,
-        ggml_cont(ctx, ggml_permute(ctx, kqv, 0, 2, 1, 3)), qf, seq);
+        ggml_tensor * kq = ggml_mul_mat(ctx, K, Q);
+        ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+        ggml_tensor * attn = ggml_soft_max_ext(ctx, kq,  nullptr, scale, 0.f);
+        ggml_tensor * kqv  = ggml_mul_mat(ctx, V, attn);
+
+        att_pre = ggml_reshape_2d(ctx,
+            ggml_cont(ctx, ggml_permute(ctx, kqv, 0, 2, 1, 3)), qf, seq);
+    }
     ggml_tensor * o_out = ggml_mul_mat(ctx, w.Wo, att_pre);
     ggml_tensor * h1    = ggml_add(ctx, x_in, o_out);
 
@@ -255,18 +283,23 @@ ggml_tensor * build_expert_layer(
     ggml_tensor * K_full = ggml_concat(ctx, cached_K, k_rope,  2);
     ggml_tensor * V_full = ggml_concat(ctx, cached_V, v_h,     2);
 
-    ggml_tensor * Q = ggml_cont(ctx, ggml_permute(ctx, q_rope, 0, 2, 1, 3));
-    ggml_tensor * K = ggml_cont(ctx, ggml_permute(ctx, K_full, 0, 2, 1, 3));
-    ggml_tensor * V = ggml_cont(ctx, ggml_permute(ctx, V_full, 1, 2, 0, 3));
-
-    ggml_tensor * kq = ggml_mul_mat(ctx, K, Q);
-    ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
     const float scale = 1.f/std::sqrt((float) hd);
-    ggml_tensor * attn = ggml_soft_max_ext(ctx, kq,  nullptr, scale, 0.f);
-    ggml_tensor * kqv  = ggml_mul_mat(ctx, V, attn);
+    ggml_tensor * att_pre;
+    if (use_fused_attention()) {
+        att_pre = fused_attention(ctx, q_rope, K_full, V_full, scale, qf, seq);
+    } else {
+        ggml_tensor * Q = ggml_cont(ctx, ggml_permute(ctx, q_rope, 0, 2, 1, 3));
+        ggml_tensor * K = ggml_cont(ctx, ggml_permute(ctx, K_full, 0, 2, 1, 3));
+        ggml_tensor * V = ggml_cont(ctx, ggml_permute(ctx, V_full, 1, 2, 0, 3));
 
-    ggml_tensor * att_pre = ggml_reshape_2d(ctx,
-        ggml_cont(ctx, ggml_permute(ctx, kqv, 0, 2, 1, 3)), qf, seq);
+        ggml_tensor * kq = ggml_mul_mat(ctx, K, Q);
+        ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+        ggml_tensor * attn = ggml_soft_max_ext(ctx, kq,  nullptr, scale, 0.f);
+        ggml_tensor * kqv  = ggml_mul_mat(ctx, V, attn);
+
+        att_pre = ggml_reshape_2d(ctx,
+            ggml_cont(ctx, ggml_permute(ctx, kqv, 0, 2, 1, 3)), qf, seq);
+    }
     ggml_tensor * o_out = ggml_mul_mat(ctx, w.Wo, att_pre);
 
     ggml_tensor * h1 = ggml_add(ctx, x_in, ggml_mul(ctx, o_out, gate_attn));
@@ -431,6 +464,14 @@ std::unique_ptr<ModelArchBase> pi05_create(const std::string& mmproj_path,
             return nullptr;
         }
         m->backend = b.handle;
+
+        // On SYCL, flash attention runs on oneDNN's fused SDPA: the default
+        // there unless --flash-attn was given either way (docs/backend/ptl.md;
+        // actions move 0.0006 normalised against the unfused graph).
+        if (b.is_sycl && !opts.flash_attn.has_value() && vla::fa_takes_views()) {
+            vla::set_flash_attn(true);
+            std::printf("vla(pi05): flash attention = on (SYCL default; --flash-attn 0 to disable)\n");
+        }
     }
 
     // The SigLIP tower is now bundled in the ckpt GGUF; mmproj_path is ignored.
