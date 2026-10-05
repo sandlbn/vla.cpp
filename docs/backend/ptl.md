@@ -172,6 +172,30 @@ server-side inference per step (3.1x) - again overlapping, no regression.
 
 Regenerate with `scripts/plot_libero_ptl.py` (arguments in its docstring).
 
+## OpenVINO GPU: use 2026.2, not 2026.3, for f16
+
+BitVLA (q8_0 weights) on OpenVINO's GPU plugin, LIBERO-object, 10 tasks x 5
+episodes, same vla.cpp build:
+
+| OpenVINO | precision | success | server ms/step |
+|---|---|---|---:|
+| 2026.3.1 (Arch package) | f32 | **50/50** | 272 |
+| 2026.3.1 (Arch package) | f16 | **0/10** (stopped) | 78 |
+| 2026.2.1 (`scripts/install_ov.sh --prefix`) | f16 | **50/50** | 94 |
+
+The f16 failure is a 2026.3 GPU plugin regression, not the part or the
+precision: under 2026.2.1 the f16 actions sit within 0.10 of the f32 reference,
+under 2026.3.1 they are 0.31 away and the 8-step chunk is distorted. Per-op
+probing against an f32 CPU reference shows no single bad op - f16 rounding
+grows layer by layer through BitVLA's int8 activation quantisers - so there is
+no graph-level workaround short of running at f32. To use f16 on this part,
+install 2026.2 locally and point the build at it:
+
+```bash
+bash scripts/install_ov.sh --prefix ~/opt/vla-deps/ov2026.2 --ubuntu 24.04
+OV_ROOT=~/opt/vla-deps/ov2026.2/openvino BUILD_DIR=$PWD/build-ov262 ci/local/build.sh ov
+```
+
 ## NPU (OpenVINO, `GGML_OPENVINO_DEVICE=NPU`)
 
 Status: **runs, but BitVLA's LM produces NaN actions** - not usable yet.
@@ -189,6 +213,15 @@ Status: **runs, but BitVLA's LM produces NaN actions** - not usable yet.
   with it, with the f32-widened mode 2 and with bf16 weights, so a second op
   overflows as well (the squared-ReLU gate, relu(g)^2 * u, is the first
   suspect). Next step: bisect the LM graph op by op on the NPU.
+- Since then: act_quant (inf scale on the all-zero action rows), RoPE (f16
+  angles; now from f32 host tables) and the FFN gate are fixed, and the NPU
+  output is finite - but still noisy (chunk spread 0.13-0.22 vs ~0.02) on both
+  OpenVINO 2026.2 and 2026.3. The NPU compiles the whole graph at f16, and the
+  same rounding growth that sinks the 2026.3 GPU path applies.
+- pi0 runs end to end on the NPU (643 ms; its SigLIP vision tower 58.6 ms,
+  against ~54 ms on the GPU through SYCL) but returns NaN actions - Gemma's
+  activations overflow f16. Evo-1 does not compile on the NPU driver
+  (`vclAllocatedExecutableCreate2` invalid argument).
 
 ## Switches
 
