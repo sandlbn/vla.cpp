@@ -85,10 +85,10 @@ weight unpack). The AOT build takes roughly twice as long.
 |---|---|---:|---:|---:|
 | BitVLA | SYCL ternary kernels | 128.5 ms | **83.8 ms** | -35% |
 | BitVLA | OpenVINO GPU, q8_0, f16 | 228.6 ms | - | (SYCL is 2.7x faster) |
-| pi0 | SYCL, bf16 act, `--flash-attn 1` | 453 ms | **346 ms** | -24% |
-| pi0 | SYCL, f32 act, `--flash-attn 1` | 481 ms | **379 ms** | -21% |
-| Evo-1 | SYCL, bf16 act, `--flash-attn 1` | 1314 ms | **512 ms** | -61% |
-| Evo-1 | SYCL, f32 act, `--flash-attn 1` | 1443 ms | **583 ms** | -60% |
+| pi0 | SYCL, bf16 act | 453 ms | **346 ms** | -24% |
+| pi0 | SYCL, f32 act | 481 ms | **379 ms** | -21% |
+| Evo-1 | SYCL, bf16 act | 1314 ms | **512 ms** | -61% |
+| Evo-1 | SYCL, f32 act | 1443 ms | **583 ms** | -60% |
 
 ![Per-model latency before and after, SYCL on Panther Lake](../img/ptl_sycl_models.png)
 
@@ -124,6 +124,10 @@ What is left: the ternary GEMMs are ~30 TOPS at M=330, ~80% of the measured
 37 TOPS ceiling, and they are ~65% of the request.
 
 ### The ggml graph models (pi0, Evo-1)
+
+Flash attention is **on by default on SYCL** for pi0 and Evo-1 (both
+LIBERO-validated below); `--flash-attn 0` restores the unfused graph. Other
+backends keep it opt-in.
 
 - **`GGML_OP_FLASH_ATTN_EXT` on oneDNN's SDPA** (`src/sycl/vla_sycl_attn.cpp`),
   claimed in the existing ggml-sycl hook. ggml-sycl's own FA is slower than the

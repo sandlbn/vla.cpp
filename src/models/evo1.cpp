@@ -422,6 +422,14 @@ std::unique_ptr<ModelArchBase> evo1_create(const std::string& mmproj_path,
         }
         m->backend = b.handle;
 
+        // On SYCL, flash attention runs on oneDNN's fused SDPA and is both faster
+        // and LIBERO-validated (docs/backend/ptl.md), so it is the default there
+        // unless --flash-attn was given either way.
+        if (b.is_sycl && !opts.flash_attn.has_value() && vla::fa_takes_views()) {
+            vla::set_flash_attn(true);
+            std::printf("vla(evo1): flash attention = on (SYCL default; --flash-attn 0 to disable)\n");
+        }
+
         // BF16 activations need BF16-resident weights and a GPU BF16 GEMM path.
         // Both are in tree: src/cuda/vla_cuda_bf16.cu and src/sycl/vla_sycl_bf16.cpp.
         // Only one of the two register calls is ever more than an empty inline.
