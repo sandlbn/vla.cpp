@@ -33,6 +33,10 @@
 #include "bitvla_lm_cuda.h"
 #include "kernels/bitvla/device.h"
 #include "kernels/bitvla/gemm.h"
+#ifdef VLA_BITVLA_FUSED_OPS
+#include "env_flag.h"
+#include "kernels/bitvla/bitvla_fused.h"
+#endif
 
 #include <cmath>
 #include <cstdint>
@@ -254,6 +258,67 @@ static int run_vit_layer(bitvla_vit_cuda_ctx* ctx, int L, vla_stream stream) {
     return 0;
 }
 
+#ifdef VLA_BITVLA_FUSED_OPS
+// run_vit_layer with its row kernels fused (bitvla_fused.h). The fc2 output's
+// bias and residual are deferred into the next layer's ln1, so on return d_h
+// still lacks this layer's MLP branch - it sits in d_fc2_out - and the caller
+// folds it in. Same bits as run_vit_layer.
+static int run_vit_layer_fused(bitvla_vit_cuda_ctx* ctx, int L, vla_stream stream) {
+    auto& lr = ctx->layers[L];
+    const int seq = ctx->n_patches, H = ctx->hidden, n_heads = ctx->n_heads;
+    const int hd  = ctx->head_dim, ffn = ctx->ffn, ffn_pad = ctx->ffn_pad;
+
+    const bool first = L == 0;
+    bitvla_add_layernorm_quant_bf16(ctx->d_h, first ? nullptr : ctx->d_fc2_out,
+                                    first ? nullptr : ctx->layers[L - 1].fc2_b,
+                                    lr.ln1_w, lr.ln1_b, ctx->d_act_int8_h, ctx->d_act_s,
+                                    ctx->ln_eps, seq, H, stream);
+
+    bitlinear_int8xint2_m(ctx->d_act_int8_h, lr.q_packed, ctx->d_q_proj, ctx->d_act_s, lr.q_ws, seq, H, H, stream);
+    bitvla_add_bias_bf16(ctx->d_q_proj, lr.q_b, ctx->d_q_proj, seq, H, stream);
+    bitlinear_int8xint2_m(ctx->d_act_int8_h, lr.k_packed, ctx->d_k_proj, ctx->d_act_s, lr.k_ws, seq, H, H, stream);
+    bitvla_add_bias_bf16(ctx->d_k_proj, lr.k_b, ctx->d_k_proj, seq, H, stream);
+    bitlinear_int8xint2_m(ctx->d_act_int8_h, lr.v_packed, ctx->d_v_proj, ctx->d_act_s, lr.v_ws, seq, H, H, stream);
+    bitvla_add_bias_bf16(ctx->d_v_proj, lr.v_b, ctx->d_v_proj, seq, H, stream);
+
+    bitvla_transpose_sNhd_to_NshHd_bf16(ctx->d_q_proj, ctx->d_q_HShd, seq, n_heads, hd, stream);
+    bitvla_transpose_sNhd_to_NshHd_bf16(ctx->d_k_proj, ctx->d_k_HShd, seq, n_heads, hd, stream);
+    bitvla_transpose_sNhd_to_NshHd_bf16(ctx->d_v_proj, ctx->d_v_HShd, seq, n_heads, hd, stream);
+
+    if (vla_gemm_bf16_nt_batched(ctx->d_q_HShd, ctx->d_k_HShd, ctx->d_scores,
+                                 seq, seq, hd, n_heads,
+                                 (long long) seq * hd, (long long) seq * hd,
+                                 (long long) seq * seq, stream) != 0) {
+        std::fprintf(stderr, "vla(bitvla_vit): QK^T gemm @L%d failed\n", L);
+        return -1;
+    }
+    const float scl = 1.0f/std::sqrt((float) hd);
+    bitvla_softmax_scaled_bf16(ctx->d_scores, scl, n_heads * seq, seq, stream);
+    if (vla_gemm_bf16_nn_batched(ctx->d_scores, ctx->d_v_HShd, ctx->d_attn_out,
+                                 seq, hd, seq, n_heads,
+                                 (long long) seq * seq, (long long) seq * hd,
+                                 (long long) seq * hd, stream) != 0) {
+        std::fprintf(stderr, "vla(bitvla_vit): attn@V gemm @L%d failed\n", L);
+        return -1;
+    }
+    bitvla_transpose_NshHd_to_sNhd_bf16(ctx->d_attn_out, ctx->d_attn_merged, n_heads, seq, hd, stream);
+
+    bitvla_act_quant_cuda(ctx->d_attn_merged, ctx->d_act_int8_h, ctx->d_act_s, seq, H, stream);
+    bitlinear_int8xint2_m(ctx->d_act_int8_h, lr.o_packed, ctx->d_o_out, ctx->d_act_s, lr.o_ws, seq, H, H, stream);
+
+    bitvla_add_layernorm_quant_bf16(ctx->d_h, ctx->d_o_out, lr.o_b, lr.ln2_w, lr.ln2_b,
+                                    ctx->d_act_int8_h, ctx->d_act_s, ctx->ln_eps, seq, H, stream);
+
+    bitlinear_int8xint2_m(ctx->d_act_int8_h, lr.fc1_packed, ctx->d_fc1_dense,
+                          ctx->d_act_s, lr.fc1_ws, seq, ffn, H, stream);
+    bitvla_bias_gelu_quant_pad_bf16(ctx->d_fc1_dense, lr.fc1_b, ctx->d_act_int8_ffn,
+                                    ctx->d_act_s, seq, ffn, ffn_pad, stream);
+    bitlinear_int8xint2_m(ctx->d_act_int8_ffn, lr.fc2_packed, ctx->d_fc2_out,
+                          ctx->d_act_s, lr.fc2_ws, seq, H, ffn_pad, stream);
+    return 0;
+}
+#endif
+
 int bitvla_vit_cuda_forward(bitvla_vit_cuda_ctx* ctx,
                             const vla_bf16* d_patches,
                             vla_bf16* d_out,
@@ -272,6 +337,18 @@ int bitvla_vit_cuda_forward(bitvla_vit_cuda_ctx* ctx,
 
     bitvla_add_bf16(ctx->d_h, ctx->pos_emb, ctx->d_h, seq * H, stream);
 
+#ifdef VLA_BITVLA_FUSED_OPS
+    static const bool fused = !vla::env_flag("VLA_BITVLA_UNFUSED");
+    if (fused) {
+        for (int L=0; L<ctx->n_layers; ++L) {
+            int rc = run_vit_layer_fused(ctx, L, stream);
+            if (rc != 0)
+                return rc;
+        }
+        bitvla_bias_residual_bf16(ctx->d_h, ctx->d_fc2_out, ctx->layers[ctx->n_layers - 1].fc2_b,
+                                  seq, H, stream);
+    } else
+#endif
     for (int L=0; L<ctx->n_layers; ++L) {
         int rc = run_vit_layer(ctx, L, stream);
         if (rc != 0)

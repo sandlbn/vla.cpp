@@ -32,6 +32,10 @@
 #include "bitvla_lm_cuda.h"
 #include "kernels/bitvla/device.h"
 #include "kernels/bitvla/gemm.h"
+#ifdef VLA_BITVLA_FUSED_OPS
+#include "env_flag.h"
+#include "kernels/bitvla/bitvla_fused.h"
+#endif
 
 #include <cmath>
 #include <cstdint>
@@ -305,6 +309,103 @@ static int run_layer(bitvla_lm_cuda_ctx* ctx, int L, int seq, vla_stream stream)
     return 0;
 }
 
+#ifdef VLA_BITVLA_FUSED_OPS
+// The two norm sites before attention and the FFN, the attention sub-norm and
+// the FFN gate+sub-norm are each one row kernel (see bitvla_fused.h), and the
+// FFN's residual add is deferred into the *next* layer's input norm - so on
+// return d_h is still missing this layer's down projection, which sits in
+// d_down_out. The caller folds it in.
+//
+// Same bits as run_layer: every fused kernel reproduces the chain it replaces
+// exactly. The attention block in between is shared code.
+static int attention_block(bitvla_lm_cuda_ctx* ctx, const bitvla_lm_layer_cuda& lr, int L,
+                           int seq, vla_stream stream);
+
+static int run_layer_fused(bitvla_lm_cuda_ctx* ctx, int L, int seq, vla_stream stream) {
+    const auto& lr = ctx->layers[L];
+    const int hidden = ctx->hidden, ffn = ctx->ffn, hq = ctx->hidden_q;
+
+    bitvla_add_rmsnorm_quant_bf16(ctx->d_h, L == 0 ? nullptr : ctx->d_down_out, lr.attn_norm_w,
+                                  ctx->d_act_int8_h, ctx->d_act_s, ctx->rms_eps, seq, hidden,
+                                  stream);
+
+    if (attention_block(ctx, lr, L, seq, stream) != 0)
+        return -1;
+
+    bitvla_add_rmsnorm_quant_bf16(ctx->d_attn_merged, nullptr, lr.attn_sub_norm_w,
+                                  ctx->d_act_int8_h, ctx->d_act_s, ctx->rms_eps, seq, hq, stream);
+    bitlinear_int8xint2_m(ctx->d_act_int8_h, lr.o_packed, ctx->d_o_out,
+                          ctx->d_act_s, lr.o_ws, seq, hidden, hq, stream);
+
+    bitvla_add_rmsnorm_quant_bf16(ctx->d_h, ctx->d_o_out, lr.ffn_norm_w, ctx->d_act_int8_h,
+                                  ctx->d_act_s, ctx->rms_eps, seq, hidden, stream);
+    bitlinear_int8xint2_m(ctx->d_act_int8_h, lr.gate_up_packed, ctx->d_gate_up,
+                          ctx->d_act_s, lr.gate_up_ws, seq, 2*ffn, hidden, stream);
+
+    bitvla_sqrelu_rmsnorm_quant_bf16(ctx->d_gate_up, lr.ffn_sub_norm_w, ctx->d_act_int8_ffn,
+                                     ctx->d_act_s, ctx->rms_eps, seq, ffn, stream);
+    bitlinear_int8xint2_m(ctx->d_act_int8_ffn, lr.down_packed, ctx->d_down_out,
+                          ctx->d_act_s, lr.down_ws, seq, hidden, ffn, stream);
+    return 0;
+}
+
+// QKV projections through the merged attention output, from d_act_int8_h /
+// d_act_s. Identical to the middle of run_layer.
+static int attention_block(bitvla_lm_cuda_ctx* ctx, const bitvla_lm_layer_cuda& lr, int L,
+                           int seq, vla_stream stream) {
+    const int hidden = ctx->hidden, n_q = ctx->n_q, n_kv = ctx->n_kv, hd = ctx->head_dim;
+    const int hq = ctx->hidden_q, hkv = ctx->hidden_kv;
+
+    vla_bf16* q_dense = ctx->d_qkv;
+    vla_bf16* k_dense = ctx->d_qkv+(size_t)seq * hq;
+    vla_bf16* v_dense = ctx->d_qkv+(size_t)seq * (hq+hkv);
+    bitlinear_int8xint2_m(ctx->d_act_int8_h, lr.q_packed, q_dense,
+                          ctx->d_act_s, lr.q_ws, seq, hq,  hidden, stream);
+    bitlinear_int8xint2_m(ctx->d_act_int8_h, lr.k_packed, k_dense,
+                          ctx->d_act_s, lr.k_ws, seq, hkv, hidden, stream);
+    bitlinear_int8xint2_m(ctx->d_act_int8_h, lr.v_packed, v_dense,
+                          ctx->d_act_s, lr.v_ws, seq, hkv, hidden, stream);
+
+    bitvla_transpose_sNhd_to_NshHd_bf16(q_dense, ctx->d_q_HShd, seq, n_q,  hd, stream);
+    bitvla_transpose_sNhd_to_NshHd_bf16(k_dense, ctx->d_k_HShd, seq, n_kv, hd, stream);
+    bitvla_transpose_sNhd_to_NshHd_bf16(v_dense, ctx->d_v_HShd, seq, n_kv, hd, stream);
+
+    bitvla_rope_neox_bf16(ctx->d_q_HShd, ctx->d_cos, ctx->d_sin, n_q,  seq, hd, stream);
+    bitvla_rope_neox_bf16(ctx->d_k_HShd, ctx->d_cos, ctx->d_sin, n_kv, seq, hd, stream);
+
+    bitvla_repeat_kv_bf16(ctx->d_k_HShd, ctx->d_k_rep, n_q, n_kv, seq, hd, stream);
+    bitvla_repeat_kv_bf16(ctx->d_v_HShd, ctx->d_v_rep, n_q, n_kv, seq, hd, stream);
+
+    if (vla_gemm_bf16_nt_batched(ctx->d_q_HShd, ctx->d_k_rep, ctx->d_scores,
+                                 seq, seq, hd, n_q,
+                                 (long long)seq * hd, (long long)seq * hd,
+                                 (long long)seq * seq, stream) != 0) {
+        std::fprintf(stderr, "vla(bitvla_lm): QK^T gemm failed @L%d\n", L);
+        return -1;
+    }
+
+    const float scl = 1.0f/std::sqrt((float)hd);
+    bitvla_softmax_scaled_bf16(ctx->d_scores, scl, n_q * seq, seq, stream);
+
+    if (vla_gemm_bf16_nn_batched(ctx->d_scores, ctx->d_v_rep, ctx->d_attn_out,
+                                 seq, hd, seq, n_q,
+                                 (long long)seq * seq, (long long)seq * hd,
+                                 (long long)seq * hd, stream) != 0) {
+        std::fprintf(stderr, "vla(bitvla_lm): attn@V gemm failed @L%d\n", L);
+        return -1;
+    }
+
+    bitvla_transpose_NshHd_to_sNhd_bf16(ctx->d_attn_out, ctx->d_attn_merged, n_q, seq, hd, stream);
+    return 0;
+}
+
+/// @c VLA_BITVLA_UNFUSED=1 forces the per-op chain, to bisect against.
+static bool use_fused() {
+    static const bool on = !vla::env_flag("VLA_BITVLA_UNFUSED");
+    return on;
+}
+#endif
+
 extern "C" int bitvla_lm_cuda_forward(bitvla_lm_cuda_ctx* ctx,
                                       const vla_bf16* d_in,
                                       vla_bf16* d_out,
@@ -319,6 +420,21 @@ extern "C" int bitvla_lm_cuda_forward(bitvla_lm_cuda_ctx* ctx,
 
     DEV_OK(vla_dev_memcpy_d2d(ctx->d_h, d_in, (size_t)seq * ctx->hidden*sizeof(vla_bf16), stream));
     dump_bf16(dump_dir, "lm_layer_input", ctx->d_h, (size_t)seq * ctx->hidden, stream);
+
+#ifdef VLA_BITVLA_FUSED_OPS
+    // The per-layer dumps need d_h complete after every layer, which the
+    // deferred residual is not; dumping is a debugging mode, so it gets the
+    // per-op chain.
+    if (use_fused() && !dump_dir && !std::getenv("VLA_BITVLA_DUMP_L0")) {
+        for (int L=0; L<ctx->n_layers; ++L) {
+            if (run_layer_fused(ctx, L, seq, stream) != 0)
+                return -1;
+        }
+        bitvla_add_bf16(ctx->d_h, ctx->d_down_out, ctx->d_h, seq * ctx->hidden, stream);
+        bitvla_rmsnorm_bf16(ctx->d_h, ctx->output_norm_w, d_out, ctx->rms_eps, seq, ctx->hidden, stream);
+        return 0;
+    }
+#endif
 
     for (int L=0; L<ctx->n_layers; ++L) {
         int rc = run_layer(ctx, L, seq, stream);

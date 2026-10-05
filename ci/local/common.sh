@@ -52,6 +52,15 @@ load_oneapi() {
   # shellcheck disable=SC1091
   source "$ONEAPI_ROOT/setvars.sh" --force >/dev/null 2>&1 || fail "TOOLCHAIN setvars.sh"
   command -v icpx >/dev/null 2>&1 || fail "TOOLCHAIN icpx not on PATH after setvars.sh"
+  # Distro oneAPI packages (Arch) ship the compiler and oneMKL but no oneDNN, and
+  # the distro onednn is CPU-only. A SYCL-runtime oneDNN built with icpx into
+  # $DNNL_ROOT takes precedence when present.
+  DNNL_ROOT="${DNNL_ROOT:-$DEPS_PREFIX/onednn}"
+  if [ -f "$DNNL_ROOT/lib/cmake/dnnl/dnnl-config.cmake" ]; then
+    export CMAKE_PREFIX_PATH="$DNNL_ROOT${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
+    export LD_LIBRARY_PATH="$DNNL_ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    echo "ONEDNN:    $DNNL_ROOT"
+  fi
   echo "ICPX:      $(icpx --version | head -1)"
   echo "GPU:       $(sycl-ls 2>/dev/null | grep -m1 level_zero || echo 'no Level Zero device')"
 }
@@ -69,11 +78,18 @@ load_openvino() {
       [ -n "$d" ] && OV_ROOT="$d"
     fi
   fi
-  [ -f "$OV_ROOT/setupvars.sh" ] ||
-      fail "no OpenVINO at $OV_ROOT -- run scripts/install_ov.sh or set OV_ROOT"
-  # shellcheck disable=SC1091
-  source "$OV_ROOT/setupvars.sh" >/dev/null 2>&1 || fail "TOOLCHAIN setupvars.sh"
-  echo "OPENVINO:  $OV_ROOT"
+  if [ -f "$OV_ROOT/setupvars.sh" ]; then
+    # shellcheck disable=SC1091
+    source "$OV_ROOT/setupvars.sh" >/dev/null 2>&1 || fail "TOOLCHAIN setupvars.sh"
+    echo "OPENVINO:  $OV_ROOT"
+  elif [ -f /usr/lib/cmake/openvino/OpenVINOConfig.cmake ] ||
+       ls /usr/lib/cmake/openvino*/OpenVINOConfig.cmake >/dev/null 2>&1; then
+    # Distro package (Arch: pacman -S openvino openvino-intel-{gpu,npu}-plugin):
+    # libraries and plugins are on the default paths, there is nothing to source.
+    echo "OPENVINO:  system ($(ls /usr/lib/libopenvino.so.* 2>/dev/null | sed -n 's/.*\.so\.//p' | sort -V | tail -1))"
+  else
+    fail "no OpenVINO at $OV_ROOT -- run scripts/install_ov.sh or set OV_ROOT"
+  fi
   command -v clinfo >/dev/null 2>&1 &&
       echo "OPENCL:    $(clinfo -l 2>/dev/null | grep -m1 -i 'device' | sed 's/^ *//')"
   # Cached blobs have reloaded graphs that compute the wrong thing on the GPU

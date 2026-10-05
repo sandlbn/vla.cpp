@@ -99,6 +99,9 @@ if(GGML_SYCL AND NOT GGML_CUDA)
     # device images, and the test source itself has no SYCL in it.
     target_link_options(test_bitvla_ops_gpu PRIVATE -fsycl)
     target_compile_options(test_bitvla_ops_gpu PRIVATE -Wall -Wextra)
+    # The fused row kernels (bitvla_fused.h) are SYCL-only; hold them to
+    # bit-identity with the chains they replace.
+    target_compile_definitions(test_bitvla_ops_gpu PRIVATE VLA_BITVLA_FUSED_OPS)
     add_test(NAME bitvla_ops_gpu COMMAND test_bitvla_ops_gpu)
 elseif(GGML_CUDA)
     add_executable(test_bitvla_ops_gpu test_bitvla_ops_gpu.cpp)

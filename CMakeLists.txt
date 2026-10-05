@@ -237,6 +237,7 @@ if(GGML_SYCL AND NOT GGML_CUDA)
         src/kernels/bitvla/sycl/bitnet_sycl.cpp
         src/kernels/bitvla/sycl/bitnet_gemv_sycl.cpp
         src/kernels/bitvla/sycl/gemm_sycl.cpp
+        src/kernels/bitvla/sycl/bitvla_fused_sycl.cpp
         ${VLA_BITVLA_DRIVER_SOURCES}
     )
     set_target_properties(bitvla_sycl_kernels PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -244,6 +245,9 @@ if(GGML_SYCL AND NOT GGML_CUDA)
         ${CMAKE_CURRENT_SOURCE_DIR}/src
     )
     target_compile_features(bitvla_sycl_kernels PRIVATE cxx_std_17)
+    # The shared drivers compile into this target, so this switches them onto
+    # the fused row kernels of bitvla_fused.h (only SYCL implements them).
+    target_compile_definitions(bitvla_sycl_kernels PRIVATE VLA_BITVLA_FUSED_OPS)
     # -fp-model=precise because icpx, unlike gcc and clang, defaults to
     # -fp-model=fast. Leaving it off is opting *in* to reassociation, so "we do
     # not pass -ffast-math" is not the same statement here that it is elsewhere.

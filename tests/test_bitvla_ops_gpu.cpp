@@ -41,6 +41,9 @@
  */
 
 #include "kernels/bitvla/bitvla_lm_cuda.h"
+#ifdef VLA_BITVLA_FUSED_OPS
+#include "kernels/bitvla/bitvla_fused.h"
+#endif
 
 #include <cmath>
 #include <cstdint>
@@ -508,6 +511,154 @@ void test_act_quant_pad() {
     }
 }
 
+
+#ifdef VLA_BITVLA_FUSED_OPS
+/// Byte-compare two downloads and record the result. The fused kernels claim
+/// bit-identity with the chains they replace, so that is the gate.
+template <typename T>
+int64_t n_differ(const std::vector<T> & a, const std::vector<T> & b) {
+    int64_t n = 0;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (std::memcmp(&a[i], &b[i], sizeof(T)) != 0) ++n;
+    return n;
+}
+
+void report_fused(const char * name, int64_t bad_q, int64_t bad_s, int64_t bad_h) {
+    const bool ok = bad_q == 0 && bad_s == 0 && bad_h == 0;
+    std::printf("  %-34s %-4s %lld int8, %lld scale(s), %lld bf16 differ\n", name,
+                ok ? "OK" : "FAIL", (long long) bad_q, (long long) bad_s, (long long) bad_h);
+    if (!ok) ++g_failures;
+}
+
+/// add + rmsnorm + act_quant against the three unfused kernels, with and
+/// without the residual, at the LM's widths (hidden 2560) and an odd one.
+void test_fused_add_rmsnorm_quant() {
+    const int shapes[3][2] = {{330, 2560}, {7, 1301}, {330, 6912}};
+    for (const auto & sh : shapes) {
+        const int M = sh[0], K = sh[1];
+        for (int with_delta = 0; with_delta < 2; ++with_delta) {
+            const auto h0 = rand_bf((size_t) M * K, -6.0f, 6.0f, 11u + K);
+            const auto d0 = rand_bf((size_t) M * K, -3.0f, 3.0f, 12u + K);
+            const auto w0 = rand_bf((size_t) K, 0.2f, 1.8f, 13u + K);
+            DevBuf<uint16_t> h_a(h0), h_b(h0), d(d0), w(w0), hn((size_t) M * K);
+            DevBuf<int8_t>   q_a((size_t) M * K), q_b((size_t) M * K);
+            DevBuf<float>    s_a((size_t) M), s_b((size_t) M);
+
+            if (with_delta) bitvla_add_bf16(h_a.p, d.p, h_a.p, M * K, nullptr);
+            bitvla_rmsnorm_bf16(h_a.p, w.p, hn.p, 1e-6f, M, K, nullptr);
+            bitvla_act_quant_cuda(hn.p, q_a.p, s_a.p, M, K, nullptr);
+
+            bitvla_add_rmsnorm_quant_bf16(h_b.p, with_delta ? d.p : nullptr, w.p, q_b.p, s_b.p,
+                                          1e-6f, M, K, nullptr);
+
+            char name[64];
+            std::snprintf(name, sizeof(name), "fused %srmsnorm_quant %dx%d",
+                          with_delta ? "add_" : "", M, K);
+            report_fused(name, n_differ(q_a.download(), q_b.download()),
+                         n_differ(s_a.download(), s_b.download()),
+                         n_differ(h_a.download(), h_b.download()));
+        }
+    }
+}
+
+void test_fused_sqrelu_rmsnorm_quant() {
+    const int shapes[2][2] = {{330, 6912}, {5, 1301}};
+    for (const auto & sh : shapes) {
+        const int seq = sh[0], ffn = sh[1];
+        const auto gu0 = rand_bf((size_t) seq * 2 * ffn, -3.0f, 3.0f, 21u + ffn);
+        const auto w0  = rand_bf((size_t) ffn, 0.2f, 1.8f, 22u + ffn);
+        DevBuf<uint16_t> gu(gu0), w(w0), mid((size_t) seq * ffn);
+        DevBuf<int8_t>   q_a((size_t) seq * ffn), q_b((size_t) seq * ffn);
+        DevBuf<float>    s_a((size_t) seq), s_b((size_t) seq);
+
+        gate_up_fused_sqrelu_mul_bf16(gu.p, mid.p, seq, ffn, nullptr);
+        bitvla_rmsnorm_bf16(mid.p, w.p, mid.p, 1e-6f, seq, ffn, nullptr);
+        bitvla_act_quant_cuda(mid.p, q_a.p, s_a.p, seq, ffn, nullptr);
+
+        bitvla_sqrelu_rmsnorm_quant_bf16(gu.p, w.p, q_b.p, s_b.p, 1e-6f, seq, ffn, nullptr);
+
+        char name[64];
+        std::snprintf(name, sizeof(name), "fused sqrelu_rmsnorm_quant %dx%d", seq, ffn);
+        report_fused(name, n_differ(q_a.download(), q_b.download()),
+                     n_differ(s_a.download(), s_b.download()), 0);
+    }
+}
+
+void test_fused_add_layernorm_quant() {
+    const int shapes[2][2] = {{256, 1152}, {3, 777}};
+    for (const auto & sh : shapes) {
+        const int M = sh[0], K = sh[1];
+        for (int with_delta = 0; with_delta < 2; ++with_delta) {
+            const auto h0  = rand_bf((size_t) M * K, -6.0f, 6.0f, 31u + K);
+            const auto d0  = rand_bf((size_t) M * K, -3.0f, 3.0f, 32u + K);
+            const auto db0 = rand_bf((size_t) K, -1.0f, 1.0f, 33u + K);
+            const auto w0  = rand_bf((size_t) K, 0.2f, 1.8f, 34u + K);
+            const auto b0  = rand_bf((size_t) K, -0.5f, 0.5f, 35u + K);
+            DevBuf<uint16_t> h_a(h0), h_b(h0), d(d0), d_a(d0), db(db0), w(w0), b(b0),
+                hn((size_t) M * K);
+            DevBuf<int8_t> q_a((size_t) M * K), q_b((size_t) M * K);
+            DevBuf<float>  s_a((size_t) M), s_b((size_t) M);
+
+            if (with_delta) {
+                bitvla_add_bias_bf16(d_a.p, db.p, d_a.p, M, K, nullptr);
+                bitvla_add_bf16(h_a.p, d_a.p, h_a.p, M * K, nullptr);
+            }
+            bitvla_layernorm_bf16(h_a.p, w.p, b.p, hn.p, 1e-6f, M, K, nullptr);
+            bitvla_act_quant_cuda(hn.p, q_a.p, s_a.p, M, K, nullptr);
+
+            bitvla_add_layernorm_quant_bf16(h_b.p, with_delta ? d.p : nullptr,
+                                            with_delta ? db.p : nullptr, w.p, b.p, q_b.p, s_b.p,
+                                            1e-6f, M, K, nullptr);
+
+            char name[64];
+            std::snprintf(name, sizeof(name), "fused %slayernorm_quant %dx%d",
+                          with_delta ? "add_" : "", M, K);
+            report_fused(name, n_differ(q_a.download(), q_b.download()),
+                         n_differ(s_a.download(), s_b.download()),
+                         n_differ(h_a.download(), h_b.download()));
+        }
+    }
+}
+
+void test_fused_bias_gelu_quant_pad() {
+    const int shapes[2][3] = {{256, 4304, 4352}, {3, 197, 300}};
+    for (const auto & sh : shapes) {
+        const int M = sh[0], K_in = sh[1], K_out = sh[2];
+        const auto x0 = rand_bf((size_t) M * K_in, -4.0f, 4.0f, 41u + K_in);
+        const auto b0 = rand_bf((size_t) K_in, -1.0f, 1.0f, 42u + K_in);
+        DevBuf<uint16_t> x(x0), b(b0);
+        DevBuf<int8_t>   q_a((size_t) M * K_out), q_b((size_t) M * K_out);
+        DevBuf<float>    s_a((size_t) M), s_b((size_t) M);
+
+        bitvla_add_bias_bf16(x.p, b.p, x.p, M, K_in, nullptr);
+        bitvla_gelu_tanh_bf16(x.p, x.p, M * K_in, nullptr);
+        bitvla_act_quant_pad_cuda(x.p, q_a.p, s_a.p, M, K_in, K_out, nullptr);
+
+        x.upload(x0);
+        bitvla_bias_gelu_quant_pad_bf16(x.p, b.p, q_b.p, s_b.p, M, K_in, K_out, nullptr);
+
+        char name[64];
+        std::snprintf(name, sizeof(name), "fused bias_gelu_quant %dx%d@%d", M, K_in, K_out);
+        report_fused(name, n_differ(q_a.download(), q_b.download()),
+                     n_differ(s_a.download(), s_b.download()), 0);
+    }
+}
+
+void test_fused_bias_residual() {
+    const int M = 256, K = 1152;
+    const auto h0 = rand_bf((size_t) M * K, -6.0f, 6.0f, 51u);
+    const auto d0 = rand_bf((size_t) M * K, -3.0f, 3.0f, 52u);
+    const auto b0 = rand_bf((size_t) K, -1.0f, 1.0f, 53u);
+    DevBuf<uint16_t> h_a(h0), h_b(h0), d(d0), d_a(d0), b(b0);
+
+    bitvla_add_bias_bf16(d_a.p, b.p, d_a.p, M, K, nullptr);
+    bitvla_add_bf16(h_a.p, d_a.p, h_a.p, M * K, nullptr);
+    bitvla_bias_residual_bf16(h_b.p, d.p, b.p, M, K, nullptr);
+    report_fused("fused bias_residual 256x1152", 0, 0, n_differ(h_a.download(), h_b.download()));
+}
+#endif
+
+
 int main() {
     const int n_dev = vla_dev_count();
     if (n_dev <= 0) {
@@ -532,6 +683,13 @@ int main() {
     test_transposes();
     test_gather_rows();
     test_act_quant_pad();
+#ifdef VLA_BITVLA_FUSED_OPS
+    test_fused_add_rmsnorm_quant();
+    test_fused_sqrelu_rmsnorm_quant();
+    test_fused_add_layernorm_quant();
+    test_fused_bias_gelu_quant_pad();
+    test_fused_bias_residual();
+#endif
 
     if (g_failures) {
         std::printf("FAILED: %d op(s)\n", g_failures);
