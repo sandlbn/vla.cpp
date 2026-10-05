@@ -34,6 +34,7 @@
 #include "kernels/bitvla/sycl/dnnl_sycl.h"
 #include "kernels/bitvla/sycl/queue_sycl.h"
 
+#include "oneapi/dnnl/dnnl_graph_sycl.hpp"
 #include "oneapi/dnnl/dnnl_sycl.hpp"
 
 #include <cstdio>
@@ -44,13 +45,30 @@ namespace vla {
 
 namespace {
 
+void * graph_malloc(size_t size, size_t alignment, const void * dev, const void * ctx) {
+    return sycl::aligned_alloc_device(alignment, size, *static_cast<const sycl::device *>(dev),
+                                      *static_cast<const sycl::context *>(ctx));
+}
+
+void graph_free(void * ptr, const void *, const void * ctx, void * event) {
+    if (event) static_cast<sycl::event *>(event)->wait();
+    sycl::free(ptr, *static_cast<const sycl::context *>(ctx));
+}
+
 /// Built once per device, lazily, because nothing exists before vla_dev_set.
+///
+/// The engine carries a graph allocator so that the same engine also serves
+/// the fused attention partitions in attention_sycl.cpp - oneDNN Graph needs
+/// one to place its scratchpads, and a second engine would mean a second JIT
+/// cache. Primitives ignore the allocator.
 struct Ctx {
     dnnl::engine engine;
     dnnl::stream stream;
 
     explicit Ctx(sycl::queue & q)
-        : engine(dnnl::sycl_interop::make_engine(q.get_device(), q.get_context())),
+        : engine(dnnl::graph::sycl_interop::make_engine_with_allocator(
+              q.get_device(), q.get_context(),
+              dnnl::graph::sycl_interop::make_allocator(graph_malloc, graph_free))),
           stream(dnnl::sycl_interop::make_stream(engine, q)) {}
 };
 

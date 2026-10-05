@@ -35,6 +35,7 @@
 #include "kernels/bitvla/gemm.h"
 #ifdef VLA_BITVLA_FUSED_OPS
 #include "env_flag.h"
+#include "kernels/bitvla/attention.h"
 #include "kernels/bitvla/bitvla_fused.h"
 #endif
 
@@ -281,27 +282,32 @@ static int run_vit_layer_fused(bitvla_vit_cuda_ctx* ctx, int L, vla_stream strea
     bitlinear_int8xint2_m(ctx->d_act_int8_h, lr.v_packed, ctx->d_v_proj, ctx->d_act_s, lr.v_ws, seq, H, H, stream);
     bitvla_add_bias_bf16(ctx->d_v_proj, lr.v_b, ctx->d_v_proj, seq, H, stream);
 
-    bitvla_transpose_sNhd_to_NshHd_bf16(ctx->d_q_proj, ctx->d_q_HShd, seq, n_heads, hd, stream);
-    bitvla_transpose_sNhd_to_NshHd_bf16(ctx->d_k_proj, ctx->d_k_HShd, seq, n_heads, hd, stream);
-    bitvla_transpose_sNhd_to_NshHd_bf16(ctx->d_v_proj, ctx->d_v_HShd, seq, n_heads, hd, stream);
-
-    if (vla_gemm_bf16_nt_batched(ctx->d_q_HShd, ctx->d_k_HShd, ctx->d_scores,
-                                 seq, seq, hd, n_heads,
-                                 (long long) seq * hd, (long long) seq * hd,
-                                 (long long) seq * seq, stream) != 0) {
-        std::fprintf(stderr, "vla(bitvla_vit): QK^T gemm @L%d failed\n", L);
-        return -1;
-    }
     const float scl = 1.0f/std::sqrt((float) hd);
-    bitvla_softmax_scaled_bf16(ctx->d_scores, scl, n_heads * seq, seq, stream);
-    if (vla_gemm_bf16_nn_batched(ctx->d_scores, ctx->d_v_HShd, ctx->d_attn_out,
-                                 seq, hd, seq, n_heads,
-                                 (long long) seq * seq, (long long) seq * hd,
-                                 (long long) seq * hd, stream) != 0) {
-        std::fprintf(stderr, "vla(bitvla_vit): attn@V gemm @L%d failed\n", L);
-        return -1;
+    static const bool sdpa = !vla::env_flag("VLA_BITVLA_NO_SDPA") && !vla::env_flag("VLA_BITVLA_NO_SDPA_VIT");
+    if (!sdpa || vla_attention_bf16(ctx->d_q_proj, ctx->d_k_proj, ctx->d_v_proj,
+                                    ctx->d_attn_merged, seq, n_heads, n_heads, hd, H, H, H, scl,
+                                    stream) != 0) {
+        bitvla_transpose_sNhd_to_NshHd_bf16(ctx->d_q_proj, ctx->d_q_HShd, seq, n_heads, hd, stream);
+        bitvla_transpose_sNhd_to_NshHd_bf16(ctx->d_k_proj, ctx->d_k_HShd, seq, n_heads, hd, stream);
+        bitvla_transpose_sNhd_to_NshHd_bf16(ctx->d_v_proj, ctx->d_v_HShd, seq, n_heads, hd, stream);
+
+        if (vla_gemm_bf16_nt_batched(ctx->d_q_HShd, ctx->d_k_HShd, ctx->d_scores,
+                                     seq, seq, hd, n_heads,
+                                     (long long) seq * hd, (long long) seq * hd,
+                                     (long long) seq * seq, stream) != 0) {
+            std::fprintf(stderr, "vla(bitvla_vit): QK^T gemm @L%d failed\n", L);
+            return -1;
+        }
+        bitvla_softmax_scaled_bf16(ctx->d_scores, scl, n_heads * seq, seq, stream);
+        if (vla_gemm_bf16_nn_batched(ctx->d_scores, ctx->d_v_HShd, ctx->d_attn_out,
+                                     seq, hd, seq, n_heads,
+                                     (long long) seq * seq, (long long) seq * hd,
+                                     (long long) seq * hd, stream) != 0) {
+            std::fprintf(stderr, "vla(bitvla_vit): attn@V gemm @L%d failed\n", L);
+            return -1;
+        }
+        bitvla_transpose_NshHd_to_sNhd_bf16(ctx->d_attn_out, ctx->d_attn_merged, n_heads, seq, hd, stream);
     }
-    bitvla_transpose_NshHd_to_sNhd_bf16(ctx->d_attn_out, ctx->d_attn_merged, n_heads, seq, hd, stream);
 
     bitvla_act_quant_cuda(ctx->d_attn_merged, ctx->d_act_int8_h, ctx->d_act_s, seq, H, stream);
     bitlinear_int8xint2_m(ctx->d_act_int8_h, lr.o_packed, ctx->d_o_out, ctx->d_act_s, lr.o_ws, seq, H, H, stream);

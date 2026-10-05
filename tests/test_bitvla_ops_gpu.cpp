@@ -42,9 +42,12 @@
 
 #include "kernels/bitvla/bitvla_lm_cuda.h"
 #ifdef VLA_BITVLA_FUSED_OPS
+#include "kernels/bitvla/attention.h"
 #include "kernels/bitvla/bitvla_fused.h"
+#include "kernels/bitvla/gemm.h"
 #endif
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -656,6 +659,125 @@ void test_fused_bias_residual() {
     bitvla_bias_residual_bf16(h_b.p, d.p, b.p, M, K, nullptr);
     report_fused("fused bias_residual 256x1152", 0, 0, n_differ(h_a.download(), h_b.download()));
 }
+
+/// Row-major Q/K RoPE against transpose-to-head-major, rope, transpose back.
+void test_fused_rope_qk_rows() {
+    const int S = 37, n_q = 20, n_kv = 5, hd = 128, half = hd / 2;
+    std::vector<float> cs((size_t) S * half), sn((size_t) S * half);
+    for (int s = 0; s < S; ++s)
+        for (int k = 0; k < half; ++k) {
+            const float ang = (float) s / std::pow(500000.0f, (float) (2 * k) / hd);
+            cs[(size_t) s * half + k] = std::cos(ang);
+            sn[(size_t) s * half + k] = std::sin(ang);
+        }
+    DevBuf<float> dcs(cs), dsn(sn);
+    const auto q0 = rand_bf((size_t) S * n_q * hd, -2.0f, 2.0f, 61u);
+    const auto k0 = rand_bf((size_t) S * n_kv * hd, -2.0f, 2.0f, 62u);
+    DevBuf<uint16_t> qa(q0), ka(k0), qb(q0), kb(k0), qh(q0.size()), kh(k0.size());
+
+    bitvla_transpose_sNhd_to_NshHd_bf16(qa.p, qh.p, S, n_q, hd, nullptr);
+    bitvla_transpose_sNhd_to_NshHd_bf16(ka.p, kh.p, S, n_kv, hd, nullptr);
+    bitvla_rope_neox_bf16(qh.p, dcs.p, dsn.p, n_q, S, hd, nullptr);
+    bitvla_rope_neox_bf16(kh.p, dcs.p, dsn.p, n_kv, S, hd, nullptr);
+    bitvla_transpose_NshHd_to_sNhd_bf16(qh.p, qa.p, n_q, S, hd, nullptr);
+    bitvla_transpose_NshHd_to_sNhd_bf16(kh.p, ka.p, n_kv, S, hd, nullptr);
+
+    bitvla_rope_neox_qk_rows_bf16(qb.p, kb.p, dcs.p, dsn.p, S, n_q, n_kv, hd, nullptr);
+    report_fused("fused rope_qk_rows 37x(20+5)x128", 0, 0,
+                 n_differ(qa.download(), qb.download()) + n_differ(ka.download(), kb.download()));
+}
+
+/**
+ * @brief Fused attention against an exact host evaluation, next to the
+ *        unfused chain it replaces scored against the same reference.
+ *
+ * The fused kernel keeps scores and softmax in f32 where the chain rounds both
+ * to bf16, so it is not bit-identical and is not meant to be; the claim is that
+ * it is no less accurate. Both are scored by absolute error against the exact
+ * output (bf16 steps are the wrong ruler here: attention outputs straddle zero,
+ * where one step is a vanishing magnitude), and the fused path must be no worse
+ * than the chain in RMS or at the worst element.
+ */
+void test_fused_attention() {
+    struct Case { int S, n_q, n_kv, hd; };
+    const Case cases[] = {{330, 20, 5, 128}, {256, 16, 16, 72}};
+    for (const auto & c : cases) {
+        const int S = c.S, n_q = c.n_q, n_kv = c.n_kv, hd = c.hd, rep = n_q / n_kv;
+        const int hq = n_q * hd, hkv = n_kv * hd;
+        const auto q0 = rand_bf((size_t) S * hq, -2.0f, 2.0f, 71u + S);
+        const auto k0 = rand_bf((size_t) S * hkv, -2.0f, 2.0f, 72u + S);
+        const auto v0 = rand_bf((size_t) S * hkv, -2.0f, 2.0f, 73u + S);
+        const float scale = 1.0f / std::sqrt((float) hd);
+
+        // Exact reference in double, from the same bf16 inputs.
+        std::vector<double> exact((size_t) S * hq);
+        std::vector<double> p(S);
+        for (int h = 0; h < n_q; ++h) {
+            const int g = h / rep;
+            for (int i = 0; i < S; ++i) {
+                double mx = -1e300;
+                for (int j = 0; j < S; ++j) {
+                    double d = 0;
+                    for (int t = 0; t < hd; ++t)
+                        d += (double) bf2f(q0[(size_t) i * hq + h * hd + t]) *
+                             (double) bf2f(k0[(size_t) j * hkv + g * hd + t]);
+                    p[j] = d * scale;
+                    if (p[j] > mx) mx = p[j];
+                }
+                double sum = 0;
+                for (int j = 0; j < S; ++j) { p[j] = std::exp(p[j] - mx); sum += p[j]; }
+                for (int t = 0; t < hd; ++t) {
+                    double o = 0;
+                    for (int j = 0; j < S; ++j) o += p[j] * (double) bf2f(v0[(size_t) j * hkv + g * hd + t]);
+                    exact[(size_t) i * hq + h * hd + t] = o / sum;
+                }
+            }
+        }
+
+        DevBuf<uint16_t> dq(q0), dk(k0), dv(v0), dout((size_t) S * hq);
+        if (vla_attention_bf16(dq.p, dk.p, dv.p, dout.p, S, n_q, n_kv, hd, hq, hkv, hq, scale,
+                               nullptr) != 0) {
+            std::printf("  fused attention S=%d unavailable\n", S);
+            ++g_failures;
+            continue;
+        }
+        const auto fused = dout.download();
+
+        // The unfused chain, exactly as the drivers issue it.
+        DevBuf<uint16_t> qh((size_t) S * hq), kh((size_t) S * hkv), vh((size_t) S * hkv),
+            kr((size_t) S * hq), vr((size_t) S * hq), sc((size_t) n_q * S * S),
+            ao((size_t) S * hq), merged((size_t) S * hq);
+        bitvla_transpose_sNhd_to_NshHd_bf16(dq.p, qh.p, S, n_q, hd, nullptr);
+        bitvla_transpose_sNhd_to_NshHd_bf16(dk.p, kh.p, S, n_kv, hd, nullptr);
+        bitvla_transpose_sNhd_to_NshHd_bf16(dv.p, vh.p, S, n_kv, hd, nullptr);
+        bitvla_repeat_kv_bf16(kh.p, kr.p, n_q, n_kv, S, hd, nullptr);
+        bitvla_repeat_kv_bf16(vh.p, vr.p, n_q, n_kv, S, hd, nullptr);
+        vla_gemm_bf16_nt_batched(qh.p, kr.p, sc.p, S, S, hd, n_q, (long long) S * hd,
+                                 (long long) S * hd, (long long) S * S, nullptr);
+        bitvla_softmax_scaled_bf16(sc.p, scale, n_q * S, S, nullptr);
+        vla_gemm_bf16_nn_batched(sc.p, vr.p, ao.p, S, hd, S, n_q, (long long) S * S,
+                                 (long long) S * hd, (long long) S * hd, nullptr);
+        bitvla_transpose_NshHd_to_sNhd_bf16(ao.p, merged.p, n_q, S, hd, nullptr);
+        const auto chain = merged.download();
+
+        double worst_f = 0, worst_c = 0, sq_f = 0, sq_c = 0;
+        for (size_t i = 0; i < exact.size(); ++i) {
+            const double df = std::fabs(bf2f(fused[i]) - exact[i]);
+            const double dc = std::fabs(bf2f(chain[i]) - exact[i]);
+            worst_f = std::max(worst_f, df);
+            worst_c = std::max(worst_c, dc);
+            sq_f += df * df;
+            sq_c += dc * dc;
+        }
+        const double rms_f = std::sqrt(sq_f / exact.size()), rms_c = std::sqrt(sq_c / exact.size());
+        const bool   ok    = rms_f <= rms_c && worst_f <= worst_c;
+        char name[64];
+        std::snprintf(name, sizeof(name), "fused attention %d %dq/%dkv x%d", S, n_q, n_kv, hd);
+        std::printf("  %-34s %-4s max|err| %.3g (chain %.3g), rms %.3g (chain %.3g)\n", name,
+                    ok ? "OK" : "FAIL", worst_f, worst_c, rms_f, rms_c);
+        if (!ok) ++g_failures;
+    }
+}
 #endif
 
 
@@ -689,6 +811,8 @@ int main() {
     test_fused_add_layernorm_quant();
     test_fused_bias_gelu_quant_pad();
     test_fused_bias_residual();
+    test_fused_rope_qk_rows();
+    test_fused_attention();
 #endif
 
     if (g_failures) {

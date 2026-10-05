@@ -61,6 +61,7 @@ struct k_sqrelu_rmsnorm_quant {};
 struct k_add_layernorm_quant {};
 struct k_bias_gelu_quant_pad {};
 struct k_bias_residual {};
+struct k_rope_qk_rows {};
 
 /// The width the unfused row kernels compiled to (unitrace: SIMD 32). Pinned
 /// so the reduction trees, and with them the bits, match.
@@ -286,5 +287,37 @@ extern "C" void bitvla_bias_residual_bf16(vla_bf16* h, const vla_bf16* delta,
             const size_t i = (size_t) m * K + k;
             const bf16   d = to_bf16(to_f32(ds[i]) + to_f32(bs[k]));
             hs[i]          = to_bf16(to_f32(hs[i]) + to_f32(d));
+        });
+}
+
+extern "C" void bitvla_rope_neox_qk_rows_bf16(vla_bf16* q, vla_bf16* k, const float* cos_tab,
+                                              const float* sin_tab, int S, int n_q, int n_kv,
+                                              int hd, vla_stream stream) {
+    if (S <= 0 || hd <= 1) return;
+    const int     half    = hd / 2;
+    const int     n_heads = n_q + n_kv;
+    sycl::queue & q_      = vla::bitvla_sycl_queue(stream);
+    bf16 *        qs      = as_bf(q);
+    bf16 *        ks      = as_bf(k);
+    // One work-item per rotated pair: (s, head, k < half). Heads [0, n_q) are
+    // Q's, the rest K's.
+    const size_t total = (size_t) S * n_heads * half;
+    constexpr int WG   = 256;
+    q_.parallel_for<k_rope_qk_rows>(
+        sycl::nd_range<1>(vla::bitvla::round_up(total, WG), WG), [=](sycl::nd_item<1> it) {
+            const size_t i = it.get_global_id(0);
+            if (i >= total) return;
+            const int kk = (int) (i % half);
+            const int hh = (int) ((i / half) % n_heads);
+            const int s  = (int) (i / ((size_t) half * n_heads));
+
+            bf16 * row = hh < n_q ? qs + ((size_t) s * n_q + hh) * hd
+                                  : ks + ((size_t) s * n_kv + (hh - n_q)) * hd;
+            const float c  = cos_tab[(size_t) s * half + kk];
+            const float si = sin_tab[(size_t) s * half + kk];
+            const float a  = to_f32(row[kk]);
+            const float b  = to_f32(row[kk + half]);
+            row[kk]        = to_bf16(a * c - b * si);
+            row[kk + half] = to_bf16(b * c + a * si);
         });
 }

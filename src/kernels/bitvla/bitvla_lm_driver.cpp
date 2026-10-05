@@ -34,6 +34,7 @@
 #include "kernels/bitvla/gemm.h"
 #ifdef VLA_BITVLA_FUSED_OPS
 #include "env_flag.h"
+#include "kernels/bitvla/attention.h"
 #include "kernels/bitvla/bitvla_fused.h"
 #endif
 
@@ -366,12 +367,23 @@ static int attention_block(bitvla_lm_cuda_ctx* ctx, const bitvla_lm_layer_cuda& 
     bitlinear_int8xint2_m(ctx->d_act_int8_h, lr.v_packed, v_dense,
                           ctx->d_act_s, lr.v_ws, seq, hkv, hidden, stream);
 
+    // RoPE in place on the row-major planes, Q and K in one launch. The fused
+    // attention then reads Q, K and V where the projections left them and
+    // writes the merged [seq, hq] rows the sub-norm wants: no head-major
+    // transposes, no repeated KV, no scores plane (attention.h).
+    bitvla_rope_neox_qk_rows_bf16(q_dense, k_dense, ctx->d_cos, ctx->d_sin, seq, n_q, n_kv, hd,
+                                  stream);
+
+    const float scl = 1.0f/std::sqrt((float)hd);
+    static const bool sdpa = !vla::env_flag("VLA_BITVLA_NO_SDPA") && !vla::env_flag("VLA_BITVLA_NO_SDPA_LM");
+    if (sdpa && vla_attention_bf16(q_dense, k_dense, v_dense, ctx->d_attn_merged, seq, n_q, n_kv,
+                                   hd, hq, hkv, hq, scl, stream) == 0)
+        return 0;
+
+    // Fallback: the unfused chain, minus the RoPE already applied above.
     bitvla_transpose_sNhd_to_NshHd_bf16(q_dense, ctx->d_q_HShd, seq, n_q,  hd, stream);
     bitvla_transpose_sNhd_to_NshHd_bf16(k_dense, ctx->d_k_HShd, seq, n_kv, hd, stream);
     bitvla_transpose_sNhd_to_NshHd_bf16(v_dense, ctx->d_v_HShd, seq, n_kv, hd, stream);
-
-    bitvla_rope_neox_bf16(ctx->d_q_HShd, ctx->d_cos, ctx->d_sin, n_q,  seq, hd, stream);
-    bitvla_rope_neox_bf16(ctx->d_k_HShd, ctx->d_cos, ctx->d_sin, n_kv, seq, hd, stream);
 
     bitvla_repeat_kv_bf16(ctx->d_k_HShd, ctx->d_k_rep, n_q, n_kv, seq, hd, stream);
     bitvla_repeat_kv_bf16(ctx->d_v_HShd, ctx->d_v_rep, n_q, n_kv, seq, hd, stream);
@@ -384,7 +396,6 @@ static int attention_block(bitvla_lm_cuda_ctx* ctx, const bitvla_lm_layer_cuda& 
         return -1;
     }
 
-    const float scl = 1.0f/std::sqrt((float)hd);
     bitvla_softmax_scaled_bf16(ctx->d_scores, scl, n_q * seq, seq, stream);
 
     if (vla_gemm_bf16_nn_batched(ctx->d_scores, ctx->d_v_rep, ctx->d_attn_out,

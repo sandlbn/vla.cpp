@@ -238,6 +238,7 @@ if(GGML_SYCL AND NOT GGML_CUDA)
         src/kernels/bitvla/sycl/bitnet_gemv_sycl.cpp
         src/kernels/bitvla/sycl/gemm_sycl.cpp
         src/kernels/bitvla/sycl/bitvla_fused_sycl.cpp
+        src/kernels/bitvla/sycl/attention_sycl.cpp
         ${VLA_BITVLA_DRIVER_SOURCES}
     )
     set_target_properties(bitvla_sycl_kernels PROPERTIES POSITION_INDEPENDENT_CODE ON)

@@ -107,6 +107,19 @@ void bitvla_bias_residual_bf16(vla_bf16* h, const vla_bf16* delta,
                                const vla_bf16* bias, int M, int K,
                                vla_stream stream);
 
+/**
+ * @brief NeoX RoPE applied in place to the Q and K projection planes, in their
+ *        row-major [S, H*hd] layout - one launch for both.
+ *
+ * Replaces the head-major transposes and the two @c bitvla_rope_neox_bf16
+ * calls ahead of the fused attention. The per-element arithmetic is
+ * @c bitvla_rope_neox_bf16's, so each rotated value is the same bits; only
+ * where it lives changes.
+ */
+void bitvla_rope_neox_qk_rows_bf16(vla_bf16* q, vla_bf16* k, const float* cos_tab,
+                                   const float* sin_tab, int S, int n_q, int n_kv,
+                                   int hd, vla_stream stream);
+
 #ifdef __cplusplus
 }
 #endif
