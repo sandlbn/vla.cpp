@@ -535,6 +535,9 @@ EDITS = {
                           gpu_prec);
         }
     }""",
+            # Marker: the activation-scale hunk below is anchored inside this
+            # replacement, so it would otherwise look unapplied on a re-configure.
+            "// vla.cpp: the GPU plugin computes in f16 unless told otherwise, which is why",
         ),
         # Anchored on the hunk above, for the reason given at the env-var table.
         (
@@ -669,6 +672,46 @@ EDITS = {
         "GGML_OPENVINO_ROPE_TABLE",
     };""",
             '"GGML_OPENVINO_ROPE_TABLE",',
+        ),
+        # f16 on the GPU: scale activations so OpenVINO >= 2026.3's fused RMSNorm
+        # cannot overflow. Anchored inside the GPU-precision hunk (marked above).
+        (
+            """    if (device_name == "GPU") {
+        const char * gpu_prec = ggml_openvino_getenv_str("GGML_OPENVINO_GPU_PRECISION", "f16");""",
+            """    // vla.cpp: GPU AT F16 NEEDS ACTIVATION SCALING FROM OPENVINO 2026.3 ON.
+    // 2026.3's RMSFusion started matching the Multiply(x, x) spelling of RMSNorm
+    // that 2026.2 left alone, so every norm became rms_gpu_bfyx_opt__f16 - whose
+    // 2560/6912-wide sum of squares overflows f16 - where 2026.2 had run the
+    // reduction on the f32-only reduce_ref by accident. BitVLA on Panther Lake
+    // went from LIBERO 50/50 (2026.2, f16) to 0/10 (2026.3, f16). The plugin's
+    // activations_scale_factor divides activations before the f16 kernels and
+    // undoes it after: at 64 the LM output is back at the f32 noise floor
+    // (rel 0.19 vs CPU f32, against 0.74 unscaled and 0.22 for the GPU at f32;
+    // 8 is not enough). GGML_OPENVINO_ACT_SCALE overrides; 0 disables.
+    if (device_name == "GPU" &&
+        strcmp(ggml_openvino_getenv_str("GGML_OPENVINO_GPU_PRECISION", "f16"), "f16") == 0) {
+        const char * act_scale = ggml_openvino_getenv_str("GGML_OPENVINO_ACT_SCALE", "64");
+        const float  scale     = (float) atof(act_scale);
+        if (scale > 0.0f) {
+            compile_config.insert({"ACTIVATIONS_SCALE_FACTOR", ov::Any(scale)});
+        }
+    }
+
+    if (device_name == "GPU") {
+        const char * gpu_prec = ggml_openvino_getenv_str("GGML_OPENVINO_GPU_PRECISION", "f16");""",
+            "// vla.cpp: GPU AT F16 NEEDS ACTIVATION SCALING FROM OPENVINO 2026.3 ON.",
+        ),
+        (
+            """        "GGML_OPENVINO_ROPE_TABLE",
+    };""",
+            """        "GGML_OPENVINO_ROPE_TABLE",
+        // vla.cpp: GPU f16 activation scale factor (default 64, 0 = off). See
+        // the compile config below.
+        "GGML_OPENVINO_ACT_SCALE",
+    };""",
+            # Not the bare name: the compile-config hunk reads the same variable,
+            # so that string is present before this hunk has run.
+            '// vla.cpp: GPU f16 activation scale factor (default 64, 0 = off). See',
         ),
     ],
     "ggml/src/ggml-openvino/openvino/op/rms_norm.cpp": [
