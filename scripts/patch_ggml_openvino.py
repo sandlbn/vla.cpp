@@ -1375,6 +1375,60 @@ class GgmlRmsRecip : public ov::op::Op {
     auto res_mul = std::make_shared<ov::op::v1::Multiply>(input_node, reciprocal);""",
             'ov::Output<ov::Node> reciprocal;',
         ),
+        # Mode 10: an RMSNorm that cannot overflow in f16, for devices that run
+        # the reduction at f16 (the NPU). Default there; opt-in elsewhere.
+        (
+            "#include <openvino/op/reduce_mean.hpp>",
+            "#include <openvino/op/abs.hpp>\n#include <openvino/op/maximum.hpp>\n#include <openvino/op/reduce_max.hpp>\n#include <openvino/op/reduce_mean.hpp>",
+            "#include <openvino/op/reduce_max.hpp>",
+        ),
+        (
+            """    const bool rms_widen =
+        (rms_mode == 2 || rms_mode == 5 || rms_mode == 6) && rms_in_type != ov::element::f32;""",
+            """    // vla.cpp, MODE 10: SCALE BY THE ROW'S OWN MAXIMUM.
+    //
+    // On Panther Lake's NPU the unmodified graph turns BitVLA's LM into NaNs:
+    // the NPU compiler runs the whole norm at f16, and a 2560- or 6912-wide sum
+    // of squares overflows 65504 once activations reach |x| ~ 10 (the same
+    // failure mode 1 hit on the GPU's rms_gpu_bfyx_opt__f16; the GPU default only
+    // survives because reduce_ref happens to be f32-only). Modes 7/8 tried a
+    // fixed scale and collapsed: no constant fits every row of every layer.
+    //
+    // A per-row scale does: with a = max|x| over the row,
+    //     x / sqrt(mean(x^2) + eps) = x / (a * sqrt(mean((x/a)^2) + eps/a^2))
+    // and every term (x/a)^2 is <= 1, so the mean is <= 1 whatever the
+    // activation range - nothing in the chain can overflow at f16, and the
+    // squares keep f16's full relative precision instead of losing their small
+    // terms under one huge one. a is floored at 1e-4, so an all-zero row still
+    // divides by a finite number, and eps/a^2 stays <= 1e3.
+    //
+    // Selected by GGML_OPENVINO_RMS_FUSION=10, and by default whenever the
+    // device is the NPU and no mode is set.
+    const char * rms_dev = std::getenv("GGML_OPENVINO_DEVICE");
+    const bool rms_amax = rms_mode == 10 ||
+                          (rms_mode == 0 && rms_dev && std::string(rms_dev).rfind("NPU", 0) == 0);
+    if (rms_amax) {
+        float eps10;
+        memcpy(&eps10, context.get_output_op_params(), sizeof(float));
+        const auto et   = input_node.get_element_type();
+        auto       axis = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {-1});
+        auto amax = std::make_shared<ov::op::v1::Maximum>(
+            std::make_shared<ov::op::v1::ReduceMax>(std::make_shared<ov::op::v0::Abs>(input_node), axis, true),
+            ov::op::v0::Constant::create(et, ov::Shape{1}, {1e-4f}));
+        auto xs   = std::make_shared<ov::op::v1::Divide>(input_node, amax);
+        auto ms   = std::make_shared<ov::op::v1::ReduceMean>(std::make_shared<ov::op::v1::Multiply>(xs, xs), axis, true);
+        auto eps_s = std::make_shared<ov::op::v1::Divide>(
+            ov::op::v0::Constant::create(et, ov::Shape{1}, {eps10}), std::make_shared<ov::op::v1::Multiply>(amax, amax));
+        auto denom = std::make_shared<ov::op::v1::Multiply>(
+            amax, std::make_shared<ov::op::v0::Sqrt>(std::make_shared<ov::op::v1::Add>(ms, eps_s)));
+        ov::Output<ov::Node> res10 = std::make_shared<ov::op::v1::Divide>(input_node, denom);
+        return rename_outputs_with_suffix({res10}, context.get_name());
+    }
+
+    const bool rms_widen =
+        (rms_mode == 2 || rms_mode == 5 || rms_mode == 6) && rms_in_type != ov::element::f32;""",
+            "// vla.cpp, MODE 10: SCALE BY THE ROW'S OWN MAXIMUM.",
+        ),
     ],
     "ggml/src/ggml-openvino/openvino/op/mulmat.cpp": [
         (

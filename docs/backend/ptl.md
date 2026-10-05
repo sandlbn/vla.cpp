@@ -144,6 +144,24 @@ it passes: LIBERO-object, 10 tasks x 5 episodes (`ci/local/libero_ptl.sh`),
 fused **50/50** against the unfused control's 50/50, at 37 ms vs 52 ms of
 server-side inference per step.
 
+## NPU (OpenVINO, `GGML_OPENVINO_DEVICE=NPU`)
+
+Status: **runs, but BitVLA's LM produces NaN actions** - not usable yet.
+
+- The NPU ("Intel AI Boost") is visible to OpenVINO once the user is in the
+  `render` group (`/dev/accel/accel0` is `root:render 0660`), after a fresh login.
+- BitVLA compiles and runs: 392 ms (bf16 weights), 513 ms (q4_0), 541 ms
+  (q8_0), against 84 ms for the SYCL path on the GPU - so even when correct it
+  would be a power/offload option, not a latency one.
+- The ViT is finite and within 4% of the GPU; the LM goes NaN. The NPU compiles
+  the whole graph at f16, and RMSNorm's wide sum of squares overflows there.
+  `GGML_OPENVINO_RMS_FUSION=10` (now the default on the NPU) rescales each row
+  by its own max so the norm cannot overflow - verified correct on the GPU at
+  f16 (actions within 0.025 of the default) - but the NPU still produces NaN
+  with it, with the f32-widened mode 2 and with bf16 weights, so a second op
+  overflows as well (the squared-ReLU gate, relu(g)^2 * u, is the first
+  suspect). Next step: bisect the LM graph op by op on the NPU.
+
 ## Switches
 
 | variable | effect |
@@ -154,3 +172,4 @@ server-side inference per step.
 | `VLA_BITVLA_GEMM_LAYOUT=plain\|blocked` | BitVLA: pin the weight layout instead of autotuning |
 | `VLA_SYCL_NO_SDPA=1` | ggml models: ggml-sycl's own flash attention |
 | `GGML_OPENVINO_DEVICE=NPU` | OpenVINO on the NPU (needs the `render` group) |
+| `GGML_OPENVINO_RMS_FUSION=10` | OpenVINO: max-scaled RMSNorm that cannot overflow at f16 (default on NPU) |
