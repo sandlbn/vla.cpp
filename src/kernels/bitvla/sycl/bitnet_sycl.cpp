@@ -62,10 +62,13 @@
 #include "kernels/bitvla/sycl/dnnl_sycl.h"
 
 #include <array>
+#include <string>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 using vla::bitvla::as_bf;
@@ -187,6 +190,28 @@ std::map<const void *, float *> & ws_cache() {
     return c;
 }
 
+/// Concatenated [N0+N1+N2, K] weights, their per-column scales and bias, for
+/// bitvla_ternary_gemm_cat3, keyed on the first packed pointer. Same eviction
+/// contract as the caches above: forgetting any one of the three source
+/// pointers drops the entry.
+struct Cat3 {
+    const void * src[3];
+    int8_t *     w     = nullptr;
+    float *      ws    = nullptr;
+    float *      bias  = nullptr;
+};
+std::map<const void *, Cat3> & cat3_cache() {
+    static std::map<const void *, Cat3> c;
+    return c;
+}
+
+/// Blocked copies of the unpacked weights, keyed on the packed pointer and the
+/// layout. Evicted with the rest by bitvla_forget_unpacked.
+std::map<const void *, std::vector<std::pair<dnnl::memory::desc, int8_t *>>> & blocked_cache() {
+    static std::map<const void *, std::vector<std::pair<dnnl::memory::desc, int8_t *>>> c;
+    return c;
+}
+
 /**
  * @brief @p ws broadcast from @p ws_num groups to one scale per output column.
  *
@@ -231,22 +256,9 @@ float * expanded_ws(const float * ws, int N, int ws_num, sycl::queue & q) {
  * because the allocator will happily hand the same address to the next
  * allocation and a stale hit would be undetectable in the output.
  */
-int8_t * unpacked_weights(const int8_t * packed, int N, int K, sycl::queue & q) {
-    std::lock_guard<std::mutex> lock(cache_mutex());
-    auto &                      cache = weight_cache();
-    auto                        it    = cache.find(packed);
-    if (it != cache.end()) return it->second;
-
-    int8_t * w = (int8_t *) vla_dev_malloc((size_t) N * K);
-    if (!w) {
-        std::fprintf(stderr,
-                     "vla(bitvla): could not allocate %lld bytes to unpack a %dx%d weight "
-                     "matrix (%s). The oneDNN reference path needs 4x the packed footprint; "
-                     "unset VLA_BITVLA_ONEDNN_GEMM to use the packed kernels.\n",
-                     (long long) N * K, N, K, vla_dev_error());
-        std::abort();
-    }
-
+/// Unpack a ladder-packed (N, K) matrix into row-major s8 at @p dst, which
+/// may be a row offset into a larger buffer (the concatenated QKV weights).
+void unpack_into(const int8_t * packed, int N, int K, int8_t * w, sycl::queue & q) {
     const int64_t n_slots = (int64_t) N * K / 16;
     const int64_t K64     = K;
     q.parallel_for<k_unpack>(sycl::range<1>((size_t) n_slots), [=](sycl::id<1> id) {
@@ -267,6 +279,24 @@ int8_t * unpacked_weights(const int8_t * packed, int N, int K, sycl::queue & q) 
         for (int t = 0; t < 16; ++t)
             dst[t] = (int8_t) ((int) ((bs[t % 4] >> (2 * (t / 4))) & 0x3u) - 2);
     });
+}
+
+int8_t * unpacked_weights(const int8_t * packed, int N, int K, sycl::queue & q) {
+    std::lock_guard<std::mutex> lock(cache_mutex());
+    auto &                      cache = weight_cache();
+    auto                        it    = cache.find(packed);
+    if (it != cache.end()) return it->second;
+
+    int8_t * w = (int8_t *) vla_dev_malloc((size_t) N * K);
+    if (!w) {
+        std::fprintf(stderr,
+                     "vla(bitvla): could not allocate %lld bytes to unpack a %dx%d weight "
+                     "matrix (%s). The oneDNN reference path needs 4x the packed footprint; "
+                     "unset VLA_BITVLA_ONEDNN_GEMM to use the packed kernels.\n",
+                     (long long) N * K, N, K, vla_dev_error());
+        std::abort();
+    }
+    unpack_into(packed, N, K, w, q);
     q.wait();
 
     cache.emplace(packed, w);
@@ -282,8 +312,31 @@ void vla::bitvla_forget_unpacked(const void * packed) {
     // both - so this looks in each cache and releases whatever it finds.
     int8_t * unpacked = nullptr;
     float *  scales   = nullptr;
+    Cat3     cat{};
+    std::vector<std::pair<dnnl::memory::desc, int8_t *>> blocked, cat_blocked;
     {
         std::lock_guard<std::mutex> lock(cache_mutex());
+
+        auto bit = blocked_cache().find(packed);
+        if (bit != blocked_cache().end()) {
+            blocked = std::move(bit->second);
+            blocked_cache().erase(bit);
+        }
+
+        auto & cc = cat3_cache();
+        for (auto cit = cc.begin(); cit != cc.end(); ++cit) {
+            const Cat3 & e = cit->second;
+            if (e.src[0] == packed || e.src[1] == packed || e.src[2] == packed) {
+                cat = e;
+                cc.erase(cit);
+                auto cb = blocked_cache().find(cat.w);
+                if (cb != blocked_cache().end()) {
+                    cat_blocked = std::move(cb->second);
+                    blocked_cache().erase(cb);
+                }
+                break;
+            }
+        }
 
         auto & cache = weight_cache();
         auto   it    = cache.find(packed);
@@ -299,7 +352,14 @@ void vla::bitvla_forget_unpacked(const void * packed) {
             wsc.erase(wit);
         }
     }
-    if (!unpacked && !scales) return;
+    for (auto & e : blocked) vla_dev_free(e.second);
+    if (cat.w) {
+        for (auto & e : cat_blocked) vla_dev_free(e.second);
+        vla_dev_free(cat.w);
+        vla_dev_free(cat.ws);
+        vla_dev_free(cat.bias);
+    }
+    if (!unpacked && !scales && blocked.empty()) return;
 
     // Deliberately outside the lock. vla_dev_free calls this function on the
     // pointer it is about to release, so freeing while holding a non-recursive
@@ -336,6 +396,135 @@ int32_t * acc_scratch(size_t elems) {
     return buf;
 }
 
+// --- weight layout autotuning ----------------------------------------------
+
+/**
+ * @brief A fused matmul built twice - once reading the unpacked weights in
+ *        place, once against a blocked layout of oneDNN's choosing - and which
+ *        of the two this device runs faster.
+ *
+ * The weights are fixed for the life of the model, so letting oneDNN pick their
+ * layout (@c format_tag::any) and reordering them into it once costs nothing per
+ * call. Whether it pays is a property of the silicon and the shape, not a
+ * constant: measured on Panther Lake's Xe3 it nearly halves some GEMMs (the
+ * 3840-wide QKV at M=330: 0.40 -> 0.23 ms; the ViT's fc1: 0.18 -> 0.09 ms) and
+ * slows others by ~15% (the ViT's fc2). So each shape is timed both ways the
+ * first time it runs and keeps the winner.
+ *
+ * Correctness does not depend on the choice: int32 accumulation is exact and
+ * the epilogue is the same post-op chain, so both produce the same bits.
+ * @c VLA_BITVLA_GEMM_LAYOUT=plain|blocked pins it.
+ */
+struct Tuned {
+    dnnl::matmul       blocked;
+    dnnl::memory::desc blocked_w;
+    int                choice = -1;  ///< -1 undecided, 0 plain, 1 blocked
+};
+
+int8_t * blocked_weights(const void * key, const dnnl::memory::desc & wd, int8_t * plain,
+                         const dnnl::memory::desc & plain_md, dnnl::engine & eng,
+                         dnnl::stream & strm, sycl::queue & q) {
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex());
+        for (auto & e : blocked_cache()[key])
+            if (e.first == wd) return e.second;
+    }
+    int8_t * w = (int8_t *) vla_dev_malloc(wd.get_size());
+    if (!w) {
+        std::fprintf(stderr, "vla(bitvla): blocked weight copy: allocation failed (%s)\n",
+                     vla_dev_error());
+        std::abort();
+    }
+    dnnl::memory src(plain_md, eng, plain), dst(wd, eng, w);
+    dnnl::reorder(src, dst).execute(strm, src, dst);
+    q.wait();
+    std::lock_guard<std::mutex> lock(cache_mutex());
+    blocked_cache()[key].emplace_back(wd, w);
+    return w;
+}
+
+int layout_override() {
+    static const int v = [] {
+        const char * e = std::getenv("VLA_BITVLA_GEMM_LAYOUT");
+        if (!e) return -1;
+        if (std::string(e) == "plain") return 0;
+        if (std::string(e) == "blocked") return 1;
+        return -1;
+    }();
+    return v;
+}
+
+/**
+ * @brief Execute @p plain or the tuned blocked variant, deciding on first use.
+ * @param args everything but DNNL_ARG_WEIGHTS
+ */
+void exec_tuned(Tuned & t, const dnnl::matmul & plain, const dnnl::matmul::primitive_desc & any_pd_proto,
+                const void * wkey, int8_t * W, const dnnl::memory::desc & b_md,
+                std::unordered_map<int, dnnl::memory> args, vla_stream stream) {
+    (void) any_pd_proto;
+    dnnl::engine & eng  = vla::bitvla_dnnl_engine(stream);
+    dnnl::stream & strm = vla::bitvla_dnnl_stream(stream);
+    sycl::queue &  q    = vla::bitvla_sycl_queue(stream);
+
+    dnnl::memory w_plain(b_md, eng, W);
+    if (t.choice == 0 || !t.blocked) {
+        args[DNNL_ARG_WEIGHTS] = w_plain;
+        plain.execute(strm, args);
+        return;
+    }
+    dnnl::memory w_blk(t.blocked_w, eng, blocked_weights(wkey, t.blocked_w, W, b_md, eng, strm, q));
+
+    if (t.choice < 0) {
+        const int forced = layout_override();
+        if (forced >= 0) {
+            t.choice = forced;
+        } else {
+            // Same work both ways, so the results are identical and it does not
+            // matter that the real output is overwritten while timing.
+            auto time = [&](const dnnl::matmul & p, const dnnl::memory & w) {
+                args[DNNL_ARG_WEIGHTS] = w;
+                p.execute(strm, args);
+                q.wait();
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int i = 0; i < 3; ++i) p.execute(strm, args);
+                q.wait();
+                return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            };
+            const double tp = time(plain, w_plain);
+            const double tb = time(t.blocked, w_blk);
+            t.choice        = tb < tp ? 1 : 0;
+            if (vla::env_flag("VLA_BITVLA_LOG_SHAPES"))
+                std::fprintf(stderr, "vla(bitvla): GEMM layout %s (plain %.1f us, blocked %.1f us)\n",
+                             t.choice ? "blocked" : "plain", tp * 1e6 / 3, tb * 1e6 / 3);
+        }
+        if (t.choice == 0) {
+            args[DNNL_ARG_WEIGHTS] = w_plain;
+            plain.execute(strm, args);
+            return;
+        }
+    }
+    args[DNNL_ARG_WEIGHTS] = w_blk;
+    t.blocked.execute(strm, args);
+}
+
+/// Build the blocked twin of a fused matmul. Leaves @p t.blocked empty if
+/// oneDNN picks the plain layout anyway, which makes exec_tuned skip tuning.
+void build_blocked(Tuned & t, const dnnl::engine & eng, const dnnl::memory::desc & a_md,
+                   const dnnl::memory::desc & b_md, const dnnl::memory::desc & c_md,
+                   const dnnl::primitive_attr & attr) {
+    if (layout_override() == 0) return;
+    const auto dims = b_md.get_dims();
+    dnnl::memory::desc any(dims, dnnl::memory::data_type::s8, dnnl::memory::format_tag::any);
+    try {
+        dnnl::matmul::primitive_desc pd(eng, a_md, any, c_md, attr);
+        if (pd.weights_desc() == b_md) return;
+        t.blocked   = dnnl::matmul(pd);
+        t.blocked_w = pd.weights_desc();
+    } catch (const dnnl::error &) {
+        // No blocked implementation for this shape: plain it is.
+    }
+}
+
 // --- primitive cache --------------------------------------------------------
 
 /// A built matmul and the descriptors its arguments must be bound with.
@@ -343,6 +532,7 @@ int32_t * acc_scratch(size_t elems) {
 struct Plan {
     dnnl::memory::desc a_md, b_md, c_md, s_md, ws_md;
     dnnl::matmul       prim;
+    Tuned              tuned;  ///< fused variant only: plain vs oneDNN-chosen weight layout
 };
 
 /**
@@ -397,7 +587,7 @@ bool fuse_epilogue(int M, int N, int K) {
  * (the dispatch table above, crossed with the sequence lengths a run uses), so
  * the map stays small and stops growing after the first forward pass.
  */
-const Plan & plan_for(const dnnl::engine & eng, int M, int N, int K, bool fused) {
+Plan & plan_for(const dnnl::engine & eng, int M, int N, int K, bool fused) {
     using dt   = dnnl::memory::data_type;
     using dims = dnnl::memory::dims;
 
@@ -448,7 +638,9 @@ const Plan & plan_for(const dnnl::engine & eng, int M, int N, int K, bool fused)
     attr.set_post_ops(po);
 
     dnnl::matmul::primitive_desc pd(eng, a_md, b_md, c_md, attr);
-    return cache.emplace(key, Plan{a_md, b_md, c_md, s_md, ws_md, dnnl::matmul(pd)}).first->second;
+    Plan p{a_md, b_md, c_md, s_md, ws_md, dnnl::matmul(pd), {}};
+    build_blocked(p.tuned, eng, a_md, b_md, c_md, attr);
+    return cache.emplace(key, p).first->second;
 }
 
 // --- the GEMM ---------------------------------------------------------------
@@ -476,7 +668,7 @@ void ternary_matmul(const char * which, int8_t * A, int8_t * B_packed, vla_bf16 
 
     int8_t *     W     = unpacked_weights(B_packed, N, K, q);
     const bool   fused = fuse_epilogue(M, N, K);
-    const Plan & plan  = plan_for(eng, M, N, K, fused);
+    Plan &       plan  = plan_for(eng, M, N, K, fused);
 
     dnnl::memory a_mem(plan.a_md, eng, A);
     dnnl::memory b_mem(plan.b_md, eng, W);
@@ -488,12 +680,12 @@ void ternary_matmul(const char * which, int8_t * A, int8_t * B_packed, vla_bf16 
         dnnl::memory s_mem(plan.s_md, eng, s);
         dnnl::memory ws_mem(plan.ws_md, eng, expanded_ws(ws, N, ws_num, q));
 
-        plan.prim.execute(vla::bitvla_dnnl_stream(stream),
-                          {{DNNL_ARG_SRC, a_mem},
-                           {DNNL_ARG_WEIGHTS, b_mem},
-                           {DNNL_ARG_DST, c_mem},
-                           {DNNL_ARG_ATTR_MULTIPLE_POST_OP(0) | DNNL_ARG_SRC_1, s_mem},
-                           {DNNL_ARG_ATTR_MULTIPLE_POST_OP(1) | DNNL_ARG_SRC_1, ws_mem}});
+        exec_tuned(plan.tuned, plan.prim, {}, B_packed, W, plan.b_md,
+                   {{DNNL_ARG_SRC, a_mem},
+                    {DNNL_ARG_DST, c_mem},
+                    {DNNL_ARG_ATTR_MULTIPLE_POST_OP(0) | DNNL_ARG_SRC_1, s_mem},
+                    {DNNL_ARG_ATTR_MULTIPLE_POST_OP(1) | DNNL_ARG_SRC_1, ws_mem}},
+                   stream);
         return;
     }
 
@@ -598,4 +790,119 @@ extern "C" void bitvla_act_quant_pad_cuda(const vla_bf16* in, int8_t* out, float
 extern "C" void bitvla_act_quant_cuda(const vla_bf16* in, int8_t* out, float* scales,
                                       int M, int K, vla_stream stream) {
     bitvla_act_quant_pad_cuda(in, out, scales, M, K, K, stream);
+}
+
+namespace {
+
+struct k_cat_ws {};
+struct k_cat_bias {};
+
+/// Build (once) the concatenated weights, scales and optional bias.
+const Cat3 & cat3_for(int8_t * const B[3], float * const ws[3], const vla_bf16 * const bias[3],
+                      const int N[3], int K, sycl::queue & q) {
+    std::lock_guard<std::mutex> lock(cache_mutex());
+    auto &                      cc = cat3_cache();
+    auto                        it = cc.find(B[0]);
+    if (it != cc.end()) return it->second;
+
+    const int Nt = N[0] + N[1] + N[2];
+    Cat3      e;
+    e.src[0] = B[0]; e.src[1] = B[1]; e.src[2] = B[2];
+    e.w      = (int8_t *) vla_dev_malloc((size_t) Nt * K);
+    e.ws     = (float *) vla_dev_malloc((size_t) Nt * sizeof(float));
+    if (bias[0]) e.bias = (float *) vla_dev_malloc((size_t) Nt * sizeof(float));
+    if (!e.w || !e.ws || (bias[0] && !e.bias)) {
+        std::fprintf(stderr, "vla(bitvla): concatenated QKV weights: allocation failed (%s)\n",
+                     vla_dev_error());
+        std::abort();
+    }
+
+    int off = 0;
+    for (int i = 0; i < 3; ++i) {
+        const int ws_num = ws_num_for(N[i], K);
+        if (ws_num == 0) unsupported_shape("bitvla_ternary_gemm_cat3", 0, N[i], K);
+        unpack_into(B[i], N[i], K, e.w + (size_t) off * K, q);
+
+        const int     per_group = N[i] / ws_num;
+        const float * w_i       = ws[i];
+        float *       dst       = e.ws + off;
+        q.parallel_for<k_cat_ws>(sycl::range<1>((size_t) N[i]),
+                                 [=](sycl::id<1> id) { dst[id[0]] = w_i[id[0] / per_group]; });
+        if (bias[0]) {
+            const bf16 * b_i = as_bf(bias[i]);
+            float *      bd  = e.bias + off;
+            q.parallel_for<k_cat_bias>(sycl::range<1>((size_t) N[i]),
+                                       [=](sycl::id<1> id) { bd[id[0]] = to_f32(b_i[id[0]]); });
+        }
+        off += N[i];
+    }
+    q.wait();
+    return cc.emplace(B[0], e).first->second;
+}
+
+struct Cat3Plan {
+    dnnl::memory::desc a_md, b_md, c_md, s_md, ws_md, bias_md;
+    dnnl::matmul       prim;
+    Tuned              tuned;
+};
+
+Cat3Plan & cat3_plan(const dnnl::engine & eng, int M, int Nt, int K, bool with_bias) {
+    using dt   = dnnl::memory::data_type;
+    using dims = dnnl::memory::dims;
+    static std::mutex                                         mu;
+    static std::map<std::array<int, 4>, Cat3Plan>             cache;
+    std::lock_guard<std::mutex>                               lock(mu);
+    const std::array<int, 4>                                  key{M, Nt, K, with_bias ? 1 : 0};
+    auto                                                      it = cache.find(key);
+    if (it != cache.end()) return it->second;
+
+    Cat3Plan p;
+    p.a_md  = dnnl::memory::desc({M, K}, dt::s8, dims{K, 1});
+    p.b_md  = dnnl::memory::desc({K, Nt}, dt::s8, dims{1, K});
+    p.c_md  = dnnl::memory::desc({M, Nt}, dt::bf16, dims{Nt, 1});
+    p.s_md  = dnnl::memory::desc({M, 1}, dt::f32, dims{1, 1});
+    p.ws_md = dnnl::memory::desc({1, Nt}, dt::f32, dims{Nt, 1});
+    dnnl::post_ops po;
+    po.append_binary(dnnl::algorithm::binary_div, p.s_md);
+    po.append_binary(dnnl::algorithm::binary_mul, p.ws_md);
+    if (with_bias) {
+        p.bias_md = p.ws_md;
+        po.append_binary(dnnl::algorithm::binary_add, p.bias_md);
+    }
+    dnnl::primitive_attr attr;
+    attr.set_post_ops(po);
+    p.prim = dnnl::matmul(dnnl::matmul::primitive_desc(eng, p.a_md, p.b_md, p.c_md, attr));
+    build_blocked(p.tuned, eng, p.a_md, p.b_md, p.c_md, attr);
+    return cache.emplace(key, p).first->second;
+}
+
+}  // namespace
+
+extern "C" void bitvla_ternary_gemm_cat3(const int8_t* A, const float* s, int M, int K,
+                                         int8_t* const B[3], float* const ws[3],
+                                         const vla_bf16* const bias[3], const int N[3],
+                                         vla_bf16* out, vla_stream stream) {
+    static const bool log_shapes = vla::env_flag("VLA_BITVLA_LOG_SHAPES");
+    if (log_shapes)
+        for (int i = 0; i < 3; ++i) shape_log().add(M, N[i], K);
+
+    sycl::queue &    q    = vla::bitvla_sycl_queue(stream);
+    dnnl::engine &   eng  = vla::bitvla_dnnl_engine(stream);
+    const Cat3 &     cat  = cat3_for(B, ws, bias, N, K, q);
+    const int        Nt   = N[0] + N[1] + N[2];
+    Cat3Plan &       plan = cat3_plan(eng, M, Nt, K, cat.bias != nullptr);
+
+    dnnl::memory a_mem(plan.a_md, eng, const_cast<int8_t *>(A));
+    dnnl::memory c_mem(plan.c_md, eng, out);
+    dnnl::memory s_mem(plan.s_md, eng, const_cast<float *>(s));
+    dnnl::memory ws_mem(plan.ws_md, eng, cat.ws);
+    std::unordered_map<int, dnnl::memory> args{
+        {DNNL_ARG_SRC, a_mem},
+        {DNNL_ARG_DST, c_mem},
+        {DNNL_ARG_ATTR_MULTIPLE_POST_OP(0) | DNNL_ARG_SRC_1, s_mem},
+        {DNNL_ARG_ATTR_MULTIPLE_POST_OP(1) | DNNL_ARG_SRC_1, ws_mem}};
+    if (cat.bias)
+        args.emplace(DNNL_ARG_ATTR_MULTIPLE_POST_OP(2) | DNNL_ARG_SRC_1,
+                     dnnl::memory(plan.bias_md, eng, cat.bias));
+    exec_tuned(plan.tuned, plan.prim, {}, cat.w, cat.w, plan.b_md, args, stream);
 }

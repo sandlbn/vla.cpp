@@ -127,7 +127,8 @@ bitvla_vit_cuda_ctx* bitvla_vit_cuda_init(int n_layers, int hidden, int n_heads,
     DEV_OKV(ctx->d_act_int8_h   = (int8_t*) vla_dev_malloc((size_t) n_patches * hidden));
     DEV_OKV(ctx->d_act_int8_ffn = (int8_t*) vla_dev_malloc((size_t) n_patches * ctx->ffn_pad));
     DEV_OKV(ctx->d_act_s        = (float*)  vla_dev_malloc((size_t) n_patches * sizeof(float)));
-    DEV_OKV(ctx->d_q_proj       = dev_bf16((size_t) n_patches * hidden));
+    // 3x: the fused path writes one concatenated [seq, 3*hidden] QKV plane here.
+    DEV_OKV(ctx->d_q_proj       = dev_bf16((size_t) n_patches * 3 * hidden));
     DEV_OKV(ctx->d_k_proj       = dev_bf16((size_t) n_patches * hidden));
     DEV_OKV(ctx->d_v_proj       = dev_bf16((size_t) n_patches * hidden));
     DEV_OKV(ctx->d_q_HShd       = dev_bf16((size_t) n_heads * n_patches * ctx->head_dim));
@@ -275,18 +276,31 @@ static int run_vit_layer_fused(bitvla_vit_cuda_ctx* ctx, int L, vla_stream strea
                                     lr.ln1_w, lr.ln1_b, ctx->d_act_int8_h, ctx->d_act_s,
                                     ctx->ln_eps, seq, H, stream);
 
-    bitlinear_int8xint2_m(ctx->d_act_int8_h, lr.q_packed, ctx->d_q_proj, ctx->d_act_s, lr.q_ws, seq, H, H, stream);
-    bitvla_add_bias_bf16(ctx->d_q_proj, lr.q_b, ctx->d_q_proj, seq, H, stream);
-    bitlinear_int8xint2_m(ctx->d_act_int8_h, lr.k_packed, ctx->d_k_proj, ctx->d_act_s, lr.k_ws, seq, H, H, stream);
-    bitvla_add_bias_bf16(ctx->d_k_proj, lr.k_b, ctx->d_k_proj, seq, H, stream);
-    bitlinear_int8xint2_m(ctx->d_act_int8_h, lr.v_packed, ctx->d_v_proj, ctx->d_act_s, lr.v_ws, seq, H, H, stream);
-    bitvla_add_bias_bf16(ctx->d_v_proj, lr.v_b, ctx->d_v_proj, seq, H, stream);
-
     const float scl = 1.0f/std::sqrt((float) hd);
-    static const bool sdpa = !vla::env_flag("VLA_BITVLA_NO_SDPA") && !vla::env_flag("VLA_BITVLA_NO_SDPA_VIT");
-    if (!sdpa || vla_attention_bf16(ctx->d_q_proj, ctx->d_k_proj, ctx->d_v_proj,
-                                    ctx->d_attn_merged, seq, n_heads, n_heads, hd, H, H, H, scl,
-                                    stream) != 0) {
+    static bool sdpa = !vla::env_flag("VLA_BITVLA_NO_SDPA") && !vla::env_flag("VLA_BITVLA_NO_SDPA_VIT");
+    bool done = false;
+    if (sdpa) {
+        // One QKV GEMM with the biases folded into its epilogue, then the fused
+        // attention straight off the concatenated plane.
+        int8_t* const         B[3]    = {lr.q_packed, lr.k_packed, lr.v_packed};
+        float* const          ws[3]   = {lr.q_ws, lr.k_ws, lr.v_ws};
+        const vla_bf16* const bias[3] = {lr.q_b, lr.k_b, lr.v_b};
+        const int             N[3]    = {H, H, H};
+        bitvla_ternary_gemm_cat3(ctx->d_act_int8_h, ctx->d_act_s, seq, H, B, ws, bias, N,
+                                 ctx->d_q_proj, stream);
+        const vla_bf16* qkv = ctx->d_q_proj;
+        done = vla_attention_bf16(qkv, qkv + H, qkv + 2*H, ctx->d_attn_merged, seq, n_heads,
+                                  n_heads, hd, 3*H, 3*H, H, scl, stream) == 0;
+        if (!done) sdpa = false;
+    }
+    if (!done) {
+        bitlinear_int8xint2_m(ctx->d_act_int8_h, lr.q_packed, ctx->d_q_proj, ctx->d_act_s, lr.q_ws, seq, H, H, stream);
+        bitvla_add_bias_bf16(ctx->d_q_proj, lr.q_b, ctx->d_q_proj, seq, H, stream);
+        bitlinear_int8xint2_m(ctx->d_act_int8_h, lr.k_packed, ctx->d_k_proj, ctx->d_act_s, lr.k_ws, seq, H, H, stream);
+        bitvla_add_bias_bf16(ctx->d_k_proj, lr.k_b, ctx->d_k_proj, seq, H, stream);
+        bitlinear_int8xint2_m(ctx->d_act_int8_h, lr.v_packed, ctx->d_v_proj, ctx->d_act_s, lr.v_ws, seq, H, H, stream);
+        bitvla_add_bias_bf16(ctx->d_v_proj, lr.v_b, ctx->d_v_proj, seq, H, stream);
+
         bitvla_transpose_sNhd_to_NshHd_bf16(ctx->d_q_proj, ctx->d_q_HShd, seq, n_heads, hd, stream);
         bitvla_transpose_sNhd_to_NshHd_bf16(ctx->d_k_proj, ctx->d_k_HShd, seq, n_heads, hd, stream);
         bitvla_transpose_sNhd_to_NshHd_bf16(ctx->d_v_proj, ctx->d_v_HShd, seq, n_heads, hd, stream);

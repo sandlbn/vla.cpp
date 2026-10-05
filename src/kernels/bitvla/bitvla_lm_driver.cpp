@@ -351,11 +351,42 @@ static int run_layer_fused(bitvla_lm_cuda_ctx* ctx, int L, int seq, vla_stream s
 }
 
 // QKV projections through the merged attention output, from d_act_int8_h /
-// d_act_s. Identical to the middle of run_layer.
+// d_act_s.
+//
+// Fused: one concatenated QKV GEMM into a [seq, hq+2*hkv] plane, RoPE in place
+// on its Q and K column blocks, and the fused attention reading all three
+// where they lie and writing the merged [seq, hq] rows (attention.h) - no
+// head-major transposes, no repeated KV, no scores plane.
+//
+// The chain below it is the unfused original, kept for VLA_BITVLA_NO_SDPA and
+// as the fallback should the fused attention be unavailable. It recomputes
+// from the int8 activations, which nothing above has overwritten.
 static int attention_block(bitvla_lm_cuda_ctx* ctx, const bitvla_lm_layer_cuda& lr, int L,
                            int seq, vla_stream stream) {
     const int hidden = ctx->hidden, n_q = ctx->n_q, n_kv = ctx->n_kv, hd = ctx->head_dim;
     const int hq = ctx->hidden_q, hkv = ctx->hidden_kv;
+    const float scl = 1.0f/std::sqrt((float)hd);
+
+    static bool sdpa = !vla::env_flag("VLA_BITVLA_NO_SDPA") && !vla::env_flag("VLA_BITVLA_NO_SDPA_LM");
+    if (sdpa) {
+        const int ld = hq + 2*hkv;
+        int8_t* const     B[3]    = {lr.q_packed, lr.k_packed, lr.v_packed};
+        float* const      ws[3]   = {lr.q_ws, lr.k_ws, lr.v_ws};
+        const vla_bf16* const bias[3] = {nullptr, nullptr, nullptr};
+        const int         N[3]    = {hq, hkv, hkv};
+        bitvla_ternary_gemm_cat3(ctx->d_act_int8_h, ctx->d_act_s, seq, hidden, B, ws, bias, N,
+                                 ctx->d_qkv, stream);
+
+        vla_bf16* q = ctx->d_qkv;
+        vla_bf16* k = ctx->d_qkv + hq;
+        vla_bf16* v = ctx->d_qkv + hq + hkv;
+        bitvla_rope_neox_qk_rows_bf16(q, k, ctx->d_cos, ctx->d_sin, seq, n_q, n_kv, hd, ld, ld,
+                                      stream);
+        if (vla_attention_bf16(q, k, v, ctx->d_attn_merged, seq, n_q, n_kv, hd, ld, ld, hq, scl,
+                               stream) == 0)
+            return 0;
+        sdpa = false;  // unavailable for this shape: stay on the chain from here on
+    }
 
     vla_bf16* q_dense = ctx->d_qkv;
     vla_bf16* k_dense = ctx->d_qkv+(size_t)seq * hq;
@@ -367,23 +398,12 @@ static int attention_block(bitvla_lm_cuda_ctx* ctx, const bitvla_lm_layer_cuda& 
     bitlinear_int8xint2_m(ctx->d_act_int8_h, lr.v_packed, v_dense,
                           ctx->d_act_s, lr.v_ws, seq, hkv, hidden, stream);
 
-    // RoPE in place on the row-major planes, Q and K in one launch. The fused
-    // attention then reads Q, K and V where the projections left them and
-    // writes the merged [seq, hq] rows the sub-norm wants: no head-major
-    // transposes, no repeated KV, no scores plane (attention.h).
-    bitvla_rope_neox_qk_rows_bf16(q_dense, k_dense, ctx->d_cos, ctx->d_sin, seq, n_q, n_kv, hd,
-                                  stream);
-
-    const float scl = 1.0f/std::sqrt((float)hd);
-    static const bool sdpa = !vla::env_flag("VLA_BITVLA_NO_SDPA") && !vla::env_flag("VLA_BITVLA_NO_SDPA_LM");
-    if (sdpa && vla_attention_bf16(q_dense, k_dense, v_dense, ctx->d_attn_merged, seq, n_q, n_kv,
-                                   hd, hq, hkv, hq, scl, stream) == 0)
-        return 0;
-
-    // Fallback: the unfused chain, minus the RoPE already applied above.
     bitvla_transpose_sNhd_to_NshHd_bf16(q_dense, ctx->d_q_HShd, seq, n_q,  hd, stream);
     bitvla_transpose_sNhd_to_NshHd_bf16(k_dense, ctx->d_k_HShd, seq, n_kv, hd, stream);
     bitvla_transpose_sNhd_to_NshHd_bf16(v_dense, ctx->d_v_HShd, seq, n_kv, hd, stream);
+
+    bitvla_rope_neox_bf16(ctx->d_q_HShd, ctx->d_cos, ctx->d_sin, n_q,  seq, hd, stream);
+    bitvla_rope_neox_bf16(ctx->d_k_HShd, ctx->d_cos, ctx->d_sin, n_kv, seq, hd, stream);
 
     bitvla_repeat_kv_bf16(ctx->d_k_HShd, ctx->d_k_rep, n_q, n_kv, seq, hd, stream);
     bitvla_repeat_kv_bf16(ctx->d_v_HShd, ctx->d_v_rep, n_q, n_kv, seq, hd, stream);

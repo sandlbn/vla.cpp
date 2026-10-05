@@ -118,7 +118,29 @@ void bitvla_bias_residual_bf16(vla_bf16* h, const vla_bf16* delta,
  */
 void bitvla_rope_neox_qk_rows_bf16(vla_bf16* q, vla_bf16* k, const float* cos_tab,
                                    const float* sin_tab, int S, int n_q, int n_kv,
-                                   int hd, vla_stream stream);
+                                   int hd, int q_ld, int k_ld, vla_stream stream);
+
+/**
+ * @brief Three ternary projections of the same activations as one GEMM.
+ *
+ * out = [A W0^T | A W1^T | A W2^T] with the bitlinear epilogue (divide by the
+ * row's activation scale, multiply by the column's weight scale) and, when
+ * @p bias[0] is non-null, + bias - written as one [M, N0+N1+N2] row-major
+ * plane. The weights are unpacked and concatenated once, on first use.
+ *
+ * Without bias the three column blocks are the same bits as three
+ * @c bitlinear_int8xint2_m calls: int32 accumulation is exact and each column
+ * sees the same epilogue. With bias the add happens before the single bf16
+ * rounding instead of after a first one, so it is one rounding more accurate
+ * than @c bitlinear_int8xint2_m followed by @c bitvla_add_bias_bf16.
+ *
+ * Replaces the LM's q/k/v projections (where k and v alone are 640 wide and
+ * run at half the XMX rate of the wide GEMMs) and the ViT's q/k/v + biases.
+ */
+void bitvla_ternary_gemm_cat3(const int8_t* A, const float* s, int M, int K,
+                              int8_t* const B[3], float* const ws[3],
+                              const vla_bf16* const bias[3], const int N[3],
+                              vla_bf16* out, vla_stream stream);
 
 #ifdef __cplusplus
 }
