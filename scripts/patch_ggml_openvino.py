@@ -660,6 +660,16 @@ EDITS = {
     };""",
             '"GGML_OPENVINO_ACT_QUANT_SAFE",',
         ),
+        (
+            """        "GGML_OPENVINO_ACT_QUANT_SAFE",
+    };""",
+            """        "GGML_OPENVINO_ACT_QUANT_SAFE",
+        // vla.cpp: RoPE from f32 host tables instead of in-graph f16 angles.
+        // Always on for the NPU. See openvino/utils.cpp make_sin_cos.
+        "GGML_OPENVINO_ROPE_TABLE",
+    };""",
+            '"GGML_OPENVINO_ROPE_TABLE",',
+        ),
     ],
     "ggml/src/ggml-openvino/openvino/op/rms_norm.cpp": [
         (
@@ -1412,8 +1422,11 @@ class GgmlRmsRecip : public ov::op::Op {
     // and every term (x/a)^2 is <= 1, so the mean is <= 1 whatever the
     // activation range - nothing in the chain can overflow at f16, and the
     // squares keep f16's full relative precision instead of losing their small
-    // terms under one huge one. a is floored at 1e-4, so an all-zero row still
-    // divides by a finite number, and eps/a^2 stays <= 1e3.
+    // terms under one huge one. The identity holds for ANY a > 0, so a can be
+    // floored freely: at 1e-2, a^2 = 1e-4 stays a normal f16 and eps/a^2 <= 0.1.
+    // (A 1e-4 floor made a^2 underflow to 0 on the NPU; eps/0 = inf, and the
+    // all-zero action-slot rows came out as 0/inf = NaN, which the attention
+    // softmax then spread to every row.)
     //
     // Selected by GGML_OPENVINO_RMS_FUSION=10, and by default whenever the
     // device is the NPU and no mode is set.
@@ -1427,7 +1440,7 @@ class GgmlRmsRecip : public ov::op::Op {
         auto       axis = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {-1});
         auto amax = std::make_shared<ov::op::v1::Maximum>(
             std::make_shared<ov::op::v1::ReduceMax>(std::make_shared<ov::op::v0::Abs>(input_node), axis, true),
-            ov::op::v0::Constant::create(et, ov::Shape{1}, {1e-4f}));
+            ov::op::v0::Constant::create(et, ov::Shape{1}, {1e-2f}));
         auto xs   = std::make_shared<ov::op::v1::Divide>(input_node, amax);
         auto ms   = std::make_shared<ov::op::v1::ReduceMean>(std::make_shared<ov::op::v1::Multiply>(xs, xs), axis, true);
         auto eps_s = std::make_shared<ov::op::v1::Divide>(
@@ -1671,6 +1684,66 @@ class GgmlRmsRecip : public ov::op::Op {
         }
     }
 """,
+        ),
+        # RoPE from f32 host tables on the NPU (see the comment in the hunk).
+        (
+            """                                                           bool stateful) {
+    if (stateful) {
+        inp_pos =""",
+            """                                                           bool stateful) {
+    // vla.cpp: ON THE NPU, ROPE ANGLES MUST NOT BE COMPUTED IN THE GRAPH. The NPU
+    // runs the graph at f16, and theta = pos * freq is not representable there:
+    // at positions 256-511 the f16 spacing is 0.25, so theta is off by up to
+    // 0.125 rad before Cos/Sin even run (measured on Panther Lake: cos/sin 10-16%
+    // off against an f32 reference, which wrecks every attention score). The
+    // CUDA/SYCL drivers avoid it the same way this does: tabulate cos/sin per
+    // position on the host in f32 - values in [-1, 1], which f16 holds to ~1e-3 -
+    // and Gather rows by the integer position. Plain RoPE only (no stateful,
+    // imrope, freq-factor tensor or YaRN); everything else keeps the in-graph
+    // path. Used on the NPU, or anywhere with GGML_OPENVINO_ROPE_TABLE=1.
+    {
+        float tb_base, tb_scale, tb_ext, tb_attn;
+        memcpy(&tb_base, rope_params + 5, sizeof(float));
+        memcpy(&tb_scale, rope_params + 6, sizeof(float));
+        memcpy(&tb_ext, rope_params + 7, sizeof(float));
+        memcpy(&tb_attn, rope_params + 8, sizeof(float));
+        const char * tb_dev = std::getenv("GGML_OPENVINO_DEVICE");
+        const char * tb_env = std::getenv("GGML_OPENVINO_ROPE_TABLE");
+        const bool   tb_on  = (tb_env && std::atoi(tb_env) > 0) ||
+                           (tb_dev && std::string(tb_dev).rfind("NPU", 0) == 0);
+        if (tb_on && !stateful && !imrope && !rope_freqs_weight && tb_ext == 0.0f) {
+            const int    n_dims = rope_params[1];
+            const size_t half   = (size_t) n_dims >> 1;
+            const size_t T      = std::max<size_t>(8192, (size_t) std::max(rope_params[4], 0));
+            const float  theta_scale = powf(tb_base, -2.0f / n_dims);
+            std::vector<float> cos_t(T * half), sin_t(T * half);
+            for (size_t p = 0; p < T; ++p) {
+                double f = 1.0;
+                for (size_t k = 0; k < half; ++k) {
+                    const double th = (double) p * f * tb_scale;
+                    cos_t[p * half + k] = (float) (std::cos(th) * tb_attn);
+                    sin_t[p * half + k] = (float) (std::sin(th) * tb_attn);
+                    f *= theta_scale;
+                }
+            }
+            // inp_pos is the integer [1, 1, 1, S] input; the in-graph path
+            // produces [1, S, 1, half].
+            auto pos_flat = std::make_shared<ov::op::v1::Reshape>(
+                inp_pos, ov::op::v0::Constant::create(ov::element::i64, {1}, {(int64_t) -1}), false);
+            auto axis0  = ov::op::v0::Constant::create(ov::element::i32, ov::Shape{}, {0});
+            auto out_sh = ov::op::v0::Constant::create(ov::element::i64, {4}, std::vector<int64_t>{1, -1, 1, (int64_t) half});
+            auto gather = [&](const std::vector<float> & t) -> Output<Node> {
+                auto tab = std::make_shared<ov::op::v0::Constant>(ov::element::f32, ov::Shape{T, half}, t);
+                return std::make_shared<ov::op::v1::Reshape>(
+                    std::make_shared<ov::op::v8::Gather>(tab, pos_flat, axis0), out_sh, false);
+            };
+            return std::make_pair(gather(sin_t), gather(cos_t));
+        }
+    }
+
+    if (stateful) {
+        inp_pos =""",
+            "// vla.cpp: ON THE NPU, ROPE ANGLES MUST NOT BE COMPUTED IN THE GRAPH.",
         ),
     ],
     "ggml/src/ggml-openvino/openvino/op_table.cpp": [
