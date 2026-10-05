@@ -64,3 +64,13 @@ uv pip install mujoco==2.3.2
 # missing, which hangs a headless eval; clear stale config and seed defaults (N).
 rm -rf "$HOME/.libero"
 echo "N" | MUJOCO_GL=egl python -c "import libero.libero" || true
+
+# The client compiles src/serving/vla.proto with the system protoc at run time
+# (eval/client/vla_cpp_client.py). protoc 26+ (rolling distros ship 3x.y) emits
+# code that imports google.protobuf.runtime_version and refuses any runtime
+# older than itself, which the protobuf pinned above (3.20) is. The newest
+# runtime is never older than a distro's protoc (protoc 36 needs 7.36).
+PROTOC_MAJOR="$(protoc --version 2>/dev/null | sed -n 's/^libprotoc \([0-9]*\).*/\1/p')"
+if [ -n "$PROTOC_MAJOR" ] && [ "$PROTOC_MAJOR" -ge 26 ]; then
+	uv pip install -U protobuf
+fi
