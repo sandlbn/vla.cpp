@@ -226,6 +226,26 @@ ggml_tensor * build_internvit_layer(ggml_context * C, const Evo1ModelArch & m, c
     const float scale = 1.0f/std::sqrt((float) hd);
     ggml_tensor * x_n1 = ggml_add(C, ggml_mul(C, ggml_norm(C, x, m.vit_ln_eps), w.n1w), w.n1b);
     ggml_tensor * qkv = ggml_add(C, mm_act(C, w.Wqkv, x_n1, at), w.bqkv);
+    ggml_tensor * att;
+    if (vla::flash_attn_enabled() && vla::fa_takes_views()) {
+        // The backend's FA converts on load and reads any strides, so it takes
+        // [hd, N, heads] views straight into the packed QKV plane: no F32 cast,
+        // no slice copies, no contiguous permutes. Same values reach the kernel.
+        auto heads_view = [&](int which) {
+            const size_t es = ggml_element_size(qkv);
+            ggml_tensor * v3 = ggml_view_3d(C, qkv, hd, n_heads, N, hd * es, qkv->nb[1],
+                                            (size_t) which * H * es);
+            return ggml_permute(C, v3, 0, 2, 1, 3);
+        };
+        att = evo1_flash_attn(C, heads_view(0), heads_view(1), heads_view(2), scale, H, N);
+        ggml_tensor * attn_out = ggml_add(C, mm_act(C, w.Wproj, as_type(C, att, at), at), w.bproj);
+        ggml_tensor * x1 = ggml_add(C, x, ggml_mul(C, attn_out, w.ls1));
+        ggml_tensor * x_n2 = ggml_add(C, ggml_mul(C, ggml_norm(C, x1, m.vit_ln_eps), w.n2w), w.n2b);
+        ggml_tensor * ff = ggml_add(C, mm_act(C, w.Wfc1, x_n2, at), w.bfc1);
+        ff = ggml_gelu_erf(C, ff);
+        ff = ggml_add(C, mm_act(C, w.Wfc2, ff, at), w.bfc2);
+        return ggml_add(C, x1, ggml_mul(C, ff, w.ls2));
+    }
     // one cast of the packed QKV rather than three of its slices
     qkv = as_type(C, qkv, GGML_TYPE_F32);
     ggml_tensor * q = ggml_cont(C, ggml_view_2d(C, qkv, H, N, qkv->nb[1], 0*H * ggml_element_size(qkv)));
@@ -233,7 +253,6 @@ ggml_tensor * build_internvit_layer(ggml_context * C, const Evo1ModelArch & m, c
     ggml_tensor * v = ggml_cont(C, ggml_view_2d(C, qkv, H, N, qkv->nb[1], 2*H * ggml_element_size(qkv)));
     ggml_tensor * Q = ggml_cont(C, ggml_permute(C, ggml_reshape_3d(C, q, hd, n_heads, N), 0, 2, 1, 3));
     ggml_tensor * K = ggml_cont(C, ggml_permute(C, ggml_reshape_3d(C, k, hd, n_heads, N), 0, 2, 1, 3));
-    ggml_tensor * att;
     if (vla::flash_attn_enabled()) {
         ggml_tensor * V = ggml_cont(C, ggml_permute(C, ggml_reshape_3d(C, v, hd, n_heads, N), 0, 2, 1, 3));
         att = evo1_flash_attn(C, Q, K, V, scale, H, N);

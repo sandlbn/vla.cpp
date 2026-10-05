@@ -38,6 +38,7 @@
 #endif
 #ifdef GGML_USE_SYCL
 #include "ggml-sycl.h"
+#include "options.h"
 #include "sycl/vla_sycl_ops.h"
 #endif
 #ifdef GGML_USE_METAL
@@ -221,6 +222,7 @@ inline Backend backend_init(const char * tag, int n_threads) {
             // on F32 graphs - and FLASH_ATTN_EXT, which it does own, is faster
             // through oneDNN's SDPA for every activation dtype.
             vla::sycl_register_bf16_ops();
+            vla::set_fa_takes_views(true);
             char desc[256] = { 0 };
             ggml_backend_sycl_get_device_description(dev, desc, sizeof(desc));
             std::printf("%s: backend = SYCL (device %d: %s)\n", tag, dev, desc);

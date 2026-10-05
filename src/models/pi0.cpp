@@ -130,6 +130,24 @@ ggml_tensor * build_siglip_layer(ggml_context * C, const EncBlockW & w, ggml_ten
                                  ggml_type at) {
     const float scale = 1.0f/std::sqrt((float) head_dim);
     ggml_tensor * n1 = ggml_add(C, ggml_mul(C, ggml_norm(C, x, ln_eps), w.ln1w), w.ln1b);
+    if (vla::flash_attn_enabled() && vla::fa_takes_views()) {
+        // The backend's FA reads the projections in place, in whatever float
+        // type and strides they come in, and converts them itself - so no F32
+        // cast and no contiguous copy per operand. Same values reach the kernel.
+        auto heads_view = [&](ggml_tensor * t) {
+            return ggml_permute(C, ggml_reshape_3d(C, t, head_dim, heads, seq), 0, 2, 1, 3);
+        };
+        ggml_tensor * fa = ggml_flash_attn_ext(C, heads_view(ggml_add(C, mm_act(C, w.Wq, n1, at), w.bq)),
+                                               heads_view(ggml_add(C, mm_act(C, w.Wk, n1, at), w.bk)),
+                                               heads_view(ggml_add(C, mm_act(C, w.Wv, n1, at), w.bv)),
+                                               nullptr, scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
+        ggml_tensor * att = ggml_reshape_2d(C, fa, hidden, seq);
+        ggml_tensor * h1 = ggml_add(C, x, ggml_add(C, mm_act(C, w.Wo, as_type(C, att, at), at), w.bo));
+        ggml_tensor * n2 = ggml_add(C, ggml_mul(C, ggml_norm(C, h1, ln_eps), w.ln2w), w.ln2b);
+        ggml_tensor * ff = ggml_add(C, mm_act(C, w.Wfc2, ggml_gelu(C, ggml_add(C, mm_act(C, w.Wfc1, n2, at), w.bfc1)), at), w.bfc2);
+        return ggml_add(C, h1, ff);
+    }
     ggml_tensor * q = as_type(C, ggml_add(C, mm_act(C, w.Wq, n1, at), w.bq), GGML_TYPE_F32);
     ggml_tensor * k = as_type(C, ggml_add(C, mm_act(C, w.Wk, n1, at), w.bk), GGML_TYPE_F32);
     ggml_tensor * v = as_type(C, ggml_add(C, mm_act(C, w.Wv, n1, at), w.bv), GGML_TYPE_F32);
@@ -172,9 +190,14 @@ ggml_tensor * build_gemma_layer(
 
     // Q/K/V land in F32: RoPE, the KV cache the suffix passes re-read, and the
     // score/softmax core all stay full precision.
+    // With a view-taking FA (fa_takes_views) V never needs F32: nothing but the
+    // attention kernel reads it, and that converts on load. Q and K still go
+    // through F32 for RoPE.
+    const bool fa_views = vla::flash_attn_enabled() && vla::fa_takes_views();
     ggml_tensor * q = as_type(ctx, mm_act(ctx, w.Wq, x_norm, at), GGML_TYPE_F32);
     ggml_tensor * k = as_type(ctx, mm_act(ctx, w.Wk, x_norm, at), GGML_TYPE_F32);
-    ggml_tensor * v = as_type(ctx, mm_act(ctx, w.Wv, x_norm, at), GGML_TYPE_F32);
+    ggml_tensor * v = fa_views ? mm_act(ctx, w.Wv, x_norm, at)
+                               : as_type(ctx, mm_act(ctx, w.Wv, x_norm, at), GGML_TYPE_F32);
 
     ggml_tensor * q_h = ggml_reshape_3d(ctx, q, hd, nq,  seq);
     ggml_tensor * k_h = ggml_reshape_3d(ctx, k, hd, nkv, seq);
@@ -202,11 +225,16 @@ ggml_tensor * build_gemma_layer(
     }
 
     const float scale = 1.f/std::sqrt((float) hd);
-    ggml_tensor * Q = ggml_cont(ctx, ggml_permute(ctx, q_rope, 0, 2, 1, 3));
-    ggml_tensor * K = ggml_cont(ctx, ggml_permute(ctx, K_full, 0, 2, 1, 3));
+    ggml_tensor * Q = ggml_permute(ctx, q_rope, 0, 2, 1, 3);
+    ggml_tensor * K = ggml_permute(ctx, K_full, 0, 2, 1, 3);
+    if (!fa_views) {
+        Q = ggml_cont(ctx, Q);
+        K = ggml_cont(ctx, K);
+    }
     ggml_tensor * att_pre;
     if (vla::flash_attn_enabled()) {
-        ggml_tensor * V = ggml_cont(ctx, ggml_permute(ctx, V_full, 0, 2, 1, 3));
+        ggml_tensor * V = ggml_permute(ctx, V_full, 0, 2, 1, 3);
+        if (!fa_views) V = ggml_cont(ctx, V);
         // ggml_flash_attn_ext asserts an F16 mask. The mask holds only 0 and
         // -inf, both exactly representable in F16, so the cast is lossless.
         ggml_tensor * mask_f16 = mask ? ggml_cast(ctx, mask, GGML_TYPE_F16) : nullptr;

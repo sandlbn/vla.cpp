@@ -72,6 +72,10 @@ bool flash_attn_enabled()    {
     return g_flash_attn;
 }
 
+namespace { bool g_fa_views = false; }
+void set_fa_takes_views(bool on) { g_fa_views = on; }
+bool fa_takes_views() { return g_fa_views; }
+
 void set_mm_prec_f32(bool on)  {
     g_mm_prec_f32 = on;
 }
