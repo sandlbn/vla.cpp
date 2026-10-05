@@ -52,6 +52,15 @@ wilson, load_arm, totals = _lb.wilson, _lb.load_arm, _lb.totals
 TASKS = ["alphabet soup", "cream cheese", "salad dressing", "bbq sauce", "ketchup",
          "tomato sauce", "butter", "milk", "chocolate pudding", "orange juice"]
 
+# What each model computes in, shown under its name. --precision MODEL=TEXT
+# overrides or adds one.
+PRECISION = {
+    "BitVLA": "weights 1.58-bit ternary (int2-packed, unpacked to int8 for the GEMMs) · "
+              "activations int8 into the GEMMs, bf16 elsewhere",
+    "π0": "weights bf16 · activations bf16",
+    "Evo-1": "weights bf16 · activations bf16",
+}
+
 # Reference categorical palette, slots 1-2 (validated pair: CVD dE 24.7).
 COLOURS = ["#2a78d6", "#eb6834"]
 SURFACE, INK, INK_2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e4e3df"
@@ -72,7 +81,12 @@ def main() -> int:
     ap.add_argument("--arm", action="append", required=True, metavar="MODEL:LABEL=PATH")
     ap.add_argument("--out", default="docs/img/libero_ptl")
     ap.add_argument("--title", default="LIBERO-object on Panther Lake (Core Ultra 7 356H), SYCL backend")
+    ap.add_argument("--precision", action="append", default=[], metavar="MODEL=TEXT")
     args = ap.parse_args()
+    precision = dict(PRECISION)
+    for spec in args.precision:
+        m, text = spec.split("=", 1)
+        precision[m] = text
 
     models: dict[str, list[tuple[str, dict]]] = {}
     for spec in args.arm:
@@ -81,7 +95,7 @@ def main() -> int:
         models.setdefault(model, []).append((label, load_arm(path, f"{model}/{label}")))
 
     n = len(models)
-    fig, axes = plt.subplots(n, 2, figsize=(11, 3.9 * n), squeeze=False,
+    fig, axes = plt.subplots(n, 2, figsize=(11, 4.2 * n), squeeze=False,
                              gridspec_kw={"width_ratios": [1.25, 1]})
     fig.patch.set_facecolor(SURFACE)
 
@@ -132,7 +146,14 @@ def main() -> int:
         ax_sr.set_xlabel("task success (Wilson 95% interval)", color=INK_2, fontsize=9)
         ax_ms.set_xlim(0, max(t["inf_ms"] for _, pt in arms for t in pt.values()) * 1.18)
         ax_ms.set_xlabel("model inference per step, ms (server side)", color=INK_2, fontsize=9)
-        ax_sr.set_title(model, loc="left", fontsize=12, color=INK, fontweight="bold", pad=34)
+        ax_sr.set_title(model, loc="left", fontsize=12, color=INK, fontweight="bold", pad=50)
+        if model in precision:
+            # Out of the layout: tight_layout would otherwise widen the left panel
+            # to fit the line and push the latency panel off to the right.
+            note = ax_sr.annotate(precision[model], xy=(0, 1), xycoords="axes fraction",
+                                  xytext=(0, 38), textcoords="offset points", fontsize=9,
+                                  color=INK_2, va="bottom", annotation_clip=False)
+            note.set_in_layout(False)
         ax_sr.legend(handles, labels, loc="lower left", bbox_to_anchor=(0, 1.0), frameon=False,
                      fontsize=8.5, ncol=1, borderaxespad=0.2, handletextpad=0.3)
 
