@@ -15,11 +15,12 @@ LIBERO-object, 10 tasks.
 | SYCL | Evo-1 (bf16) | **works**, recommended | 99/100 | 512 ms (was 1314) |
 | SYCL | pi0.5 (f32) | **works** | not run | 458 ms (was 570) |
 | OpenVINO 2026.3.1 | BitVLA f32 | works | 50/50 | 272 ms/step |
-| OpenVINO 2026.3.1 | BitVLA f16 | **broken** (plugin regression) | 0/10 | - |
+| OpenVINO 2026.3.1 | BitVLA f16 (before fix) | broken (plugin regression) | 0/10 | - |
+| OpenVINO 2026.3.1 | BitVLA f16, activation scale 64 (default now) | **works** | 49/50 | 96 ms/step |
 | OpenVINO 2026.2.1 | BitVLA f16 | works | 50/50 | 94 ms/step |
 
-The SYCL backend is the fast path on this part. On OpenVINO, use f32 with the
-distro 2026.3, or f16 with a local 2026.2 runtime (how: [ptl.md](ptl.md)).
+The SYCL backend is the fast path on this part. On OpenVINO, f16 now works on
+the distro 2026.3 too (activation scaling, on by default - [ptl.md](ptl.md)).
 
 ## NPU
 

@@ -172,7 +172,7 @@ server-side inference per step (3.1x) - again overlapping, no regression.
 
 Regenerate with `scripts/plot_libero_ptl.py` (arguments in its docstring).
 
-## OpenVINO GPU: use 2026.2, not 2026.3, for f16
+## OpenVINO GPU at f16: the 2026.3 regression and its fix
 
 BitVLA (q8_0 weights) on OpenVINO's GPU plugin, LIBERO-object, 10 tasks x 5
 episodes, same vla.cpp build:
@@ -180,21 +180,30 @@ episodes, same vla.cpp build:
 | OpenVINO | precision | success | server ms/step |
 |---|---|---|---:|
 | 2026.3.1 (Arch package) | f32 | **50/50** | 272 |
-| 2026.3.1 (Arch package) | f16 | **0/10** (stopped) | 78 |
+| 2026.3.1 (Arch package) | f16, before the fix | **0/10** (stopped) | 78 |
 | 2026.2.1 (`scripts/install_ov.sh --prefix`) | f16 | **50/50** | 94 |
+| 2026.3.1 (Arch package) | f16, `ACTIVATIONS_SCALE_FACTOR=64` (now default) | **49/50** | 96 |
 
-The f16 failure is a 2026.3 GPU plugin regression, not the part or the
-precision: under 2026.2.1 the f16 actions sit within 0.10 of the f32 reference,
-under 2026.3.1 they are 0.31 away and the 8-step chunk is distorted. Per-op
-probing against an f32 CPU reference shows no single bad op - f16 rounding
-grows layer by layer through BitVLA's int8 activation quantisers - so there is
-no graph-level workaround short of running at f32. To use f16 on this part,
-install 2026.2 locally and point the build at it:
+**Cause.** Diffing the two versions' compiled LM graphs
+(`GGML_OPENVINO_DUMP_RUNTIME=1`): 2418 nodes on 2026.2, 2086 on 2026.3, the
+difference being 121 new `rms` primitives (`rms_gpu_bfyx_opt__f16`) - 2026.3's
+RMSFusion now matches the `Multiply(x, x)` spelling of RMSNorm that 2026.2 left
+alone. Unfused, the reduction ran on the f32-only `reduce_ref`, and that kept
+its producer in f32 too. Fused, the producer is f16 - and for the FFN
+sub-norm, the producer is the gate product relu(g)^2 * u, which reaches ~1e5,
+past f16's 65504. Tapping the graph op by op shows that product going
+non-finite on 2026.3 and finite on 2026.2. A ~15-node reproducer
+(`outputs/ptl/ov_regress/repro_rms_f16.py`) shows the same: 2560 non-finite
+outputs on 2026.3 at f16, none on 2026.2.
 
-```bash
-bash scripts/install_ov.sh --prefix ~/opt/vla-deps/ov2026.2 --ubuntu 24.04
-OV_ROOT=~/opt/vla-deps/ov2026.2/openvino BUILD_DIR=$PWD/build-ov262 ci/local/build.sh ov
-```
+**Fix (default).** On the GPU at f16, ggml-openvino now sets the plugin's
+`ACTIVATIONS_SCALE_FACTOR` to 64 (`GGML_OPENVINO_ACT_SCALE` overrides; 0
+disables). On BitVLA's LM it brings 2026.3 f16 back to the f32 noise floor (rel
+error vs CPU f32: 0.74 unscaled, 0.19 at 64, against 0.22 for the GPU at f32),
+and the actions to within 0.044 of the f32 reference - closer than 2026.2 gets
+(0.099) - at 247 ms vs 1038 ms for f32. It is a workaround that depends on
+where the plugin inserts the scaling: in the isolated reproducer it does not
+help, so other graphs may need their own check.
 
 ## NPU (OpenVINO, `GGML_OPENVINO_DEVICE=NPU`)
 
