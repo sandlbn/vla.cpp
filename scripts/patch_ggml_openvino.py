@@ -647,6 +647,19 @@ EDITS = {
         cl_queue = clCreateCommandQueueWithProperties(cl_ctx, cl_device,
                                                       want_queue_profiling ? prof_qprops : nullptr, &err);""",
         ),
+        (
+            """        // graph, into the CWD. See utils.cpp.
+        "GGML_OPENVINO_DUMP_RUNTIME",
+    };""",
+            """        // graph, into the CWD. See utils.cpp.
+        "GGML_OPENVINO_DUMP_RUNTIME",
+        // vla.cpp: BitVLA's act_quant in the f16-safe order (divide by amax
+        // first). Always on for the NPU; this forces it elsewhere. See
+        // openvino/op_table.cpp.
+        "GGML_OPENVINO_ACT_QUANT_SAFE",
+    };""",
+            '"GGML_OPENVINO_ACT_QUANT_SAFE",',
+        ),
     ],
     "ggml/src/ggml-openvino/openvino/op/rms_norm.cpp": [
         (
@@ -1814,6 +1827,10 @@ static OutputVector translate_bitvla_act_quant(const NodeContext & context) {
 }  // namespace frontend
 }  // namespace ov
 """,
+            # Marker: the act_quant f16 hunk below edits inside this replacement, so
+            # without one this hunk would look unapplied on a re-configure and
+            # insert the translator a second time.
+            "static OutputVector translate_bitvla_act_quant(const NodeContext & context) {",
         ),
         (
             """        {"GGML_OP_ROLL",            op::translate_roll                             },""",
@@ -1825,6 +1842,46 @@ static OutputVector translate_bitvla_act_quant(const NodeContext & context) {
         // an unrecognised custom op to the CPU rather than reach a translator that
         // will throw, again in ggml_backend_openvino_device_supports_op.
         {"GGML_OP_MAP_CUSTOM1",     op::translate_bitvla_act_quant                 },""",
+        ),
+        # f16-safe act_quant for the NPU. Anchored on the f32 chain's first line,
+        # which the hunk above introduces and nothing later rewrites.
+        (
+            """    auto row_max = std::make_shared<ov::op::v1::ReduceMax>(std::make_shared<ov::op::v0::Abs>(input),""",
+            """    // vla.cpp: THE NPU NEEDS THE CHAIN REORDERED. The NPU compiler runs this
+    // at f16, and s = 127/amax is not representable there for a row that is
+    // all zeros (the sequence's padding rows): amax is floored at 1e-5, so s is
+    // 1.27e7 against f16's 65504 - it becomes inf, 0*inf is NaN, and every
+    // later layer is NaN (found on Panther Lake by tapping the LM IR op by op).
+    // Dividing first keeps every intermediate in range - |x/amax| <= 1, the
+    // code is <= 127, amax/127 >= 7.9e-8 - and computes the same codes up to
+    // one rounding. Used on the NPU, or anywhere with
+    // GGML_OPENVINO_ACT_QUANT_SAFE=1; the f32 chain below stays the default
+    // elsewhere because its arithmetic mirrors the C kernels exactly.
+    {
+        const char * aq_dev  = std::getenv("GGML_OPENVINO_DEVICE");
+        const bool   aq_safe = ggml_openvino_getenv_int("GGML_OPENVINO_ACT_QUANT_SAFE") ||
+                             (aq_dev && std::string(aq_dev).rfind("NPU", 0) == 0);
+        if (aq_safe) {
+            auto axis = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {-1});
+            auto am   = std::make_shared<ov::op::v1::Maximum>(
+                std::make_shared<ov::op::v1::ReduceMax>(std::make_shared<ov::op::v0::Abs>(input), axis, true),
+                ov::op::v0::Constant::create(ov::element::f32, ov::Shape{1}, {1e-5f}));
+            auto code = std::make_shared<ov::op::v0::Clamp>(
+                std::make_shared<ov::op::v5::Round>(
+                    std::make_shared<ov::op::v1::Multiply>(
+                        std::make_shared<ov::op::v1::Divide>(input, am),
+                        ov::op::v0::Constant::create(ov::element::f32, ov::Shape{1}, {127.0f})),
+                    ov::op::v5::Round::RoundMode::HALF_TO_EVEN),
+                -128.0, 127.0);
+            auto deq = std::make_shared<ov::op::v1::Divide>(
+                am, ov::op::v0::Constant::create(ov::element::f32, ov::Shape{1}, {127.0f}));
+            ov::Output<ov::Node> safe = std::make_shared<ov::op::v1::Multiply>(code, deq);
+            return rename_outputs_with_suffix({safe}, context.get_name());
+        }
+    }
+
+    auto row_max = std::make_shared<ov::op::v1::ReduceMax>(std::make_shared<ov::op::v0::Abs>(input),""",
+            "// vla.cpp: THE NPU NEEDS THE CHAIN REORDERED.",
         ),
     ],
     "ggml/src/ggml-openvino/ggml-openvino.cpp": [
@@ -2237,6 +2294,20 @@ enum ggml_status ov_graph_compute(ggml_cgraph * cgraph, ggml_backend_t backend) 
             # together on the naive path.
             """        ov::CompiledModel compiled_model;
         if (remote_context.has_value()) {""",
+        ),
+        # Number the naive-path IR dumps. IR_naive.xml is one fixed name every
+        # graph overwrites, so a BitVLA run leaves only the 8x17920 action head
+        # on disk and the ViT and LM graphs - the ones worth inspecting - are
+        # lost. One file per compiled graph, in compile order.
+        (
+            """        if (ggml_openvino_getenv_int("GGML_OPENVINO_DUMP_IR")) {
+            ov::serialize(model, "IR_naive.xml");
+        }""",
+            """        if (ggml_openvino_getenv_int("GGML_OPENVINO_DUMP_IR")) {
+            static std::atomic<int> naive_seq{0};
+            ov::serialize(model, "IR_naive_" + std::to_string(naive_seq++) + ".xml");
+        }""",
+            '"IR_naive_" + std::to_string(naive_seq++)',
         ),
     ],
 }

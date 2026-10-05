@@ -22,9 +22,10 @@
 #   ci/local/libero_ov.sh                                     # bf16/q8_0/q4_0 at f16
 #   ARMS="bf16:f32 bf16:f16" ci/local/libero_ov.sh            # precision only
 #
-# An arm is WEIGHTS:PRECISION, as in bench_ov.sh:
+# An arm is WEIGHTS:PRECISION[:DEVICE], as in bench_ov.sh:
 #   WEIGHTS    bf16 | q8_0 | q4_0   checkpoint flavour, transcoded on first use
-#   PRECISION  f32 | f16            GPU plugin compute precision
+#   PRECISION  f32 | f16            GPU plugin compute precision (the NPU is f16)
+#   DEVICE     GPU (default) | NPU  OpenVINO device, e.g. ARMS="q8_0:f16:NPU"
 #
 # Reference, Arc Pro B70, 5 ep/task (jobs 372740/372759): every arm 98-100%,
 # f16 ~16-17 ms/step against f32's 37.5. A quantised arm that drops well below
@@ -53,24 +54,29 @@ check_server_deps
 # Validate and materialise every checkpoint before the first episode, so a typo
 # in the last arm does not surface hours in.
 declare -A CKPT
+arm_w()   { echo "${1%%:*}"; }
+arm_p()   { local r="${1#*:}"; echo "${r%%:*}"; }
+arm_dev() { local r="${1#*:}"; [ "$r" = "${r#*:}" ] && echo GPU || echo "${r#*:}"; }
 for arm in $ARMS; do
-  w="${arm%%:*}"; p="${arm#*:}"
+  w="$(arm_w "$arm")"; p="$(arm_p "$arm")"
   case "$w" in bf16|q8_0|q4_0) ;; *) fail "arm $arm: weights must be bf16|q8_0|q4_0" ;; esac
   case "$p" in f32|f16) ;;           *) fail "arm $arm: precision must be f32|f16" ;; esac
+  case "$(arm_dev "$arm")" in GPU|NPU) ;; *) fail "arm $arm: device must be GPU|NPU" ;; esac
   CKPT[$arm]="$(bitvla_ckpt "$w")" || fail "CHECKPOINT $w"
 done
 
 setup_mujoco
 render_smoke
 
-arm_out() { echo "$OUTPUT_ROOT/bitvla-ov-${1%%:*}-${1#*:}"; }
+arm_out() { echo "$OUTPUT_ROOT/bitvla-ov-$(arm_w "$1")-$(arm_p "$1")$([ "$(arm_dev "$1")" = GPU ] || echo "-$(arm_dev "$1")")"; }
 
 for arm in $ARMS; do
   out="$(arm_out "$arm")"
   echo
-  echo "########## bitvla / OpenVINO GPU / ${arm%%:*} weights / ${arm#*:} compute ##########"
+  dev="$(arm_dev "$arm")"
+  echo "########## bitvla / OpenVINO $dev / $(arm_w "$arm") weights / $(arm_p "$arm") compute ##########"
   echo "CKPT: ${CKPT[$arm]}  ($(du -h "${CKPT[$arm]}" | cut -f1))"
-  GGML_OPENVINO_DEVICE=GPU GGML_OPENVINO_GPU_PRECISION="${arm#*:}" \
+  GGML_OPENVINO_DEVICE="$dev" GGML_OPENVINO_GPU_PRECISION="$(arm_p "$arm")" \
   BITVLA_CKPT="${CKPT[$arm]}" \
       run_libero_chunked "$out" bit "$BUILD_DIR" || fail "SWEEP $arm"
 
@@ -78,8 +84,8 @@ for arm in $ARMS; do
   # be reported as the GPU's. Both lines must be in the server log.
   grep -qh "backend = OPENVINO" "$out"/chunk*/_server_logs/*.log 2>/dev/null ||
       fail "$arm DID NOT USE OPENVINO"
-  grep -qh "using device GPU" "$out"/chunk*/_server_logs/*.log 2>/dev/null ||
-      fail "$arm DID NOT REACH THE GPU PLUGIN"
+  grep -qh "using device $dev" "$out"/chunk*/_server_logs/*.log 2>/dev/null ||
+      fail "$arm DID NOT REACH THE $dev PLUGIN"
   grep -h "weights resident in" "$out"/chunk*/_server_logs/*.log 2>/dev/null | tail -1
 done
 
@@ -87,7 +93,7 @@ echo
 echo "=== results ==="
 PLOT_ARMS=()
 for arm in $ARMS; do
-  PLOT_ARMS+=(--arm "bitvla:${arm%%:*} w / ${arm#*:}=$(arm_paths "$(arm_out "$arm")")")
+  PLOT_ARMS+=(--arm "bitvla:$(arm_w "$arm") w / $(arm_p "$arm") / $(arm_dev "$arm")=$(arm_paths "$(arm_out "$arm")")")
 done
 PY="$(plot_python)"
 if [ -n "$PY" ]; then

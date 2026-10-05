@@ -103,6 +103,10 @@ struct BitvlaModelArch : public ModelArchBase {
     BitvlaModelArch() : ModelArchBase(Arch::BITVLA) {}
     ~BitvlaModelArch() override;
 
+    /// Build the FFN gate in the f16-safe form (see build_lm_layer). Set on the
+    /// OpenVINO backend, which runs f16 on the GPU plugin and the NPU.
+    bool                  f16_safe_gate = false;
+
     std::string           gguf_path;
     gguf_reader           emb_reader{"bitvla"};   // stays open for per-step token-embedding row fetches
     std::vector<float>    stop_embed;   // cached constant stop-token embedding row
@@ -253,9 +257,24 @@ ggml_tensor * build_lm_layer(ggml_context * C, const BitvlaModelArch & m, const 
     ggml_tensor * h2 = rmsnorm(C, h1, w.ffn_norm, m.lm_rms_eps);
     ggml_tensor * g  = bit_linear(C, w.Wgate, nullptr, h2);
     ggml_tensor * u  = bit_linear(C, w.Wup,   nullptr, h2);
-    ggml_tensor * gsq= ggml_sqr(C, ggml_relu(C, g));
-    ggml_tensor * gu = ggml_mul(C, gsq, u);
-    ggml_tensor * fsub= rmsnorm(C, gu, w.ffn_sub_norm, m.lm_rms_eps);
+    // relu(g)^2 * u reaches ~1e5 in BitVLA's LM - past f16's 65504 - so on a
+    // backend that computes at f16 (OpenVINO's GPU plugin by default, the NPU
+    // always) the square overflows, the sub-norm turns it into a collapsed or
+    // NaN row, and the action chunk dies. RMSNorm is scale-invariant:
+    // rmsnorm(v / k, eps / k^2) == rmsnorm(v, eps) exactly, so the gate is
+    // built pre-scaled by 1/32 (k = 1024) with eps scaled to match. Same
+    // mathematics; only where the f16 range sits differs. Other backends keep
+    // the literal form and its bits.
+    ggml_tensor * gu;
+    float         sub_eps = m.lm_rms_eps;
+    if (m.f16_safe_gate) {
+        constexpr float kGate = 1.0f / 32.0f;
+        gu      = ggml_mul(C, ggml_sqr(C, ggml_scale(C, ggml_relu(C, g), kGate)), u);
+        sub_eps = m.lm_rms_eps * kGate * kGate * kGate * kGate;
+    } else {
+        gu = ggml_mul(C, ggml_sqr(C, ggml_relu(C, g)), u);
+    }
+    ggml_tensor * fsub= rmsnorm(C, gu, w.ffn_sub_norm, sub_eps);
     ggml_tensor * dn = bit_linear(C, w.Wdown, nullptr, fsub);
     return ggml_add(C, h1, dn);
 }
@@ -690,9 +709,11 @@ std::unique_ptr<ModelArchBase> bitvla_create(const std::string& mmproj_path,
         ggml_backend_cpu_set_n_threads(m->backend, m->n_threads);
         std::printf("vla(bitvla): ggml backend = CPU (%d threads) - GPU LM module activates below if available\n", m->n_threads);
     } else {
-        m->backend = backend_init("vla(bitvla)", m->n_threads).handle;
+        const Backend b = backend_init("vla(bitvla)", m->n_threads);
+        m->backend = b.handle;
         if (!m->backend)
             return nullptr;
+        m->f16_safe_gate = b.is_openvino;
     }
 
     ggml_init_params wp = {  (size_t) 32*1024*1024,  nullptr,  true };
