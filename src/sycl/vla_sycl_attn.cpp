@@ -94,9 +94,9 @@ Ctx & ctx_for(sycl::queue & q) {
 
 struct Key {
     long long S, S_kv, H, H_kv, D, mask_ld;
-    bool      has_mask, out_bf16;
+    bool      has_mask;
     float     scale;
-    auto      tie() const { return std::tie(S, S_kv, H, H_kv, D, mask_ld, has_mask, out_bf16, scale); }
+    auto      tie() const { return std::tie(S, S_kv, H, H_kv, D, mask_ld, has_mask, scale); }
     bool      operator<(const Key & o) const { return tie() < o.tie(); }
 };
 
@@ -125,8 +125,13 @@ Plan build(const Key & key, sycl::queue & q, Ctx & c) {
     // S rows are read.
     p.mask = lt(id++, gdt::f16, lt::dims{1, 1, 1, S, Skv},
                 lt::dims{S * key.mask_ld, S * key.mask_ld, S * key.mask_ld, key.mask_ld, 1});
-    // dst is [D, H, S]: element (h, s, d) at s*H*D + h*D + d.
-    p.out = lt(id++, key.out_bf16 ? gdt::bf16 : gdt::f32, lt::dims{1, key.H_kv, rep, S, D},
+    // Output in ggml's dst order [D, H, S] - element (h, s, d) at
+    // s*H*D + h*D + d - but F16, into scratch: oneDNN lowers the pattern to its
+    // fused micro-kernel only when the output type matches the inputs', and an
+    // F32 output silently becomes three separate primitives instead (measured:
+    // pi0's attention then runs as gemm + softmax + gemm). The widening to the
+    // real dst type is one cheap elementwise pass afterwards.
+    p.out = lt(id++, gdt::f16, lt::dims{1, key.H_kv, rep, S, D},
                lt::dims{S * key.H * D, rep * D, D, key.H * D, 1});
 
     const lt::dims score{1, key.H_kv, rep, S, Skv};
@@ -185,11 +190,11 @@ Plan build(const Key & key, sycl::queue & q, Ctx & c) {
     return p;
 }
 
-/// Grown, never shrunk: one region each for the F16 q, k and v.
+/// Grown, never shrunk: one region each for the F16 q, k, v and output.
 half * scratch(sycl::queue & q, int slot, size_t elems) {
     static std::mutex mu;
-    static half *     buf[3] = {nullptr, nullptr, nullptr};
-    static size_t     cap[3] = {0, 0, 0};
+    static half *     buf[4] = {nullptr, nullptr, nullptr, nullptr};
+    static size_t     cap[4] = {0, 0, 0, 0};
     std::lock_guard<std::mutex> lock(mu);
     if (elems > cap[slot]) {
         if (buf[slot]) {
@@ -203,6 +208,8 @@ half * scratch(sycl::queue & q, int slot, size_t elems) {
 }
 
 struct k_to_f16 {};
+struct k_from_f16 {};
+struct k_from_f16_bf {};
 
 /// [D, S, H] tensor of any float type, any strides -> contiguous F16 [H][S][D].
 bool to_f16(const ggml_tensor * t, half * dst, sycl::queue & q) {
@@ -261,7 +268,7 @@ bool sycl_flash_attn_ext(ggml_tensor * dst, sycl::queue & q) {
         return false;
 
     const Key key{S, Skv, H, Hkv, D, M ? (long long) (M->nb[1] / sizeof(half)) : Skv, M != nullptr,
-                  dst->type == GGML_TYPE_BF16, scale};
+                  scale};
 
     Ctx & c = ctx_for(q);
     static std::mutex          mu;
@@ -275,6 +282,7 @@ bool sycl_flash_attn_ext(ggml_tensor * dst, sycl::queue & q) {
     }
     if (!p->ok) return false;
 
+    half * o16 = scratch(q, 3, (size_t) (D * S * H));
     half * q16 = scratch(q, 0, (size_t) (D * S * H));
     half * k16 = scratch(q, 1, (size_t) (D * Skv * Hkv));
     half * v16 = scratch(q, 2, (size_t) (D * Skv * Hkv));
@@ -284,7 +292,7 @@ bool sycl_flash_attn_ext(ggml_tensor * dst, sycl::queue & q) {
 
     using dnnl::graph::tensor;
     tensor tq(p->q, c.engine, q16), tk(p->k, c.engine, k16), tv(p->v, c.engine, v16);
-    tensor ts(p->scale, c.engine, p->d_scale), to(p->out, c.engine, dst->data);
+    tensor ts(p->scale, c.engine, p->d_scale), to(p->out, c.engine, o16);
     try {
         if (M) {
             tensor tm(p->mask, c.engine, M->data);
@@ -295,6 +303,18 @@ bool sycl_flash_attn_ext(ggml_tensor * dst, sycl::queue & q) {
     } catch (const dnnl::error & e) {
         std::fprintf(stderr, "vla(sycl): fused SDPA execute failed: %s\n", e.what());
         return false;
+    }
+
+    // Widen into the real dst, which is contiguous in the same order.
+    const size_t n = (size_t) (D * S * H);
+    if (dst->type == GGML_TYPE_F32) {
+        float * o = static_cast<float *>(dst->data);
+        q.parallel_for<k_from_f16>(sycl::range<1>(n), [=](sycl::id<1> i) { o[i] = (float) o16[i]; });
+    } else {
+        auto * o = static_cast<sycl::ext::oneapi::bfloat16 *>(dst->data);
+        q.parallel_for<k_from_f16_bf>(sycl::range<1>(n), [=](sycl::id<1> i) {
+            o[i] = sycl::ext::oneapi::bfloat16((float) o16[i]);
+        });
     }
     return true;
 }
