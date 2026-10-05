@@ -27,6 +27,8 @@ per work-item only reaches ~29 GB/s**; the 77 GB/s ceiling takes 16-byte loads.
 Kernels tuned for the B70 that move one bf16 per work-item per loop trip run at
 a third of what the part can do here.
 
+![Achieved DRAM read bandwidth by access pattern](../img/ptl_bandwidth.png)
+
 The CPU (16 cores, AVX-VNNI) and the NPU (`/dev/accel/accel0`) share the same
 memory.
 
@@ -87,6 +89,13 @@ weight unpack). The AOT build takes roughly twice as long.
 | pi0 | SYCL, f32 act, `--flash-attn 1` | 481 ms | **379 ms** | -21% |
 | Evo-1 | SYCL, bf16 act, `--flash-attn 1` | 1314 ms | **512 ms** | -61% |
 | Evo-1 | SYCL, f32 act, `--flash-attn 1` | 1443 ms | **583 ms** | -60% |
+
+![Per-model latency before and after, SYCL on Panther Lake](../img/ptl_sycl_models.png)
+
+![BitVLA latency after each change](../img/ptl_bitvla_steps.png)
+
+Regenerate with `python scripts/plot_ptl_sycl.py` (any python with matplotlib,
+e.g. the LIBERO venv).
 
 ## What changed, and why
 
