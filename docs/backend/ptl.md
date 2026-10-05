@@ -153,6 +153,14 @@ it passes: LIBERO-object, 10 tasks x 5 episodes (`ci/local/libero_ptl.sh`),
 fused **50/50** against the unfused control's 50/50, at 37 ms vs 52 ms of
 server-side inference per step.
 
+pi0, 10 tasks x 10 episodes: bf16 + flash attention **81/100** (Wilson 95%
+72-87%) against the bf16 control's 72/100 (63-80%). The intervals overlap on
+every task, so this reads as no regression rather than an improvement.
+
+![LIBERO-object per task: success with Wilson intervals, and inference latency](../img/libero_ptl.png)
+
+Regenerate with `scripts/plot_libero_ptl.py` (arguments in its docstring).
+
 ## NPU (OpenVINO, `GGML_OPENVINO_DEVICE=NPU`)
 
 Status: **runs, but BitVLA's LM produces NaN actions** - not usable yet.
